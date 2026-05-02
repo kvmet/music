@@ -332,6 +332,9 @@ pub enum NoiseColor {
     Pink,
     /// Sample-and-hold noise at a fixed slow rate. Adds a "grainy" crackle.
     Grain,
+    /// 16-bit LFSR clocked at `noise_filter_hz`. Tunable digital / chip noise.
+    /// (Filter still applies on top.)
+    Digital,
 }
 
 /// Paul Kellet's IIR pink-noise filter state.
@@ -370,6 +373,39 @@ impl GrainState {
             self.held = white;
         }
         self.counter = (self.counter + 1) % interval;
+        self.held
+    }
+}
+
+/// Tunable LFSR digital noise. Clocks bits out at `rate_hz`.
+struct DigitalState {
+    lfsr: u32,
+    accum: f32,
+    held: f32,
+}
+
+impl Default for DigitalState {
+    fn default() -> Self {
+        Self {
+            lfsr: 0xACE1,
+            accum: 0.0,
+            held: 0.0,
+        }
+    }
+}
+
+impl DigitalState {
+    fn next(&mut self, rate_hz: f32, sample_rate: u32) -> f32 {
+        let step = (rate_hz.max(1.0) / sample_rate as f32).clamp(0.0, 1.0);
+        self.accum += step;
+        while self.accum >= 1.0 {
+            self.accum -= 1.0;
+            // 16-bit Galois LFSR — taps at 16, 14, 13, 11.
+            let bit =
+                (self.lfsr ^ (self.lfsr >> 2) ^ (self.lfsr >> 3) ^ (self.lfsr >> 5)) & 1;
+            self.lfsr = (self.lfsr >> 1) | (bit << 15);
+            self.held = if (self.lfsr & 1) == 0 { 1.0 } else { -1.0 };
+        }
         self.held
     }
 }
@@ -565,6 +601,7 @@ pub struct DrumVoice {
     noise_filter: OnePole,
     pink: PinkState,
     grain: GrainState,
+    digital: DigitalState,
     crusher: Crusher,
     post_filter: Biquad,
     rng: u32,
@@ -583,6 +620,7 @@ impl DrumVoice {
             noise_filter: OnePole::new(params.noise_filter_hz, params.noise_filter_mode, sample_rate),
             pink: PinkState::default(),
             grain: GrainState::default(),
+            digital: DigitalState::default(),
             crusher: Crusher::new(),
             post_filter: Biquad::new(
                 params.post_filter_hz,
@@ -613,6 +651,9 @@ impl DrumVoice {
             NoiseColor::White => white,
             NoiseColor::Pink => self.pink.next(white),
             NoiseColor::Grain => self.grain.next(white, self.sample_rate),
+            NoiseColor::Digital => self
+                .digital
+                .next(self.params.noise_filter_hz, self.sample_rate),
         }
     }
 
@@ -658,16 +699,17 @@ impl Voice for DrumVoice {
                 let base_freq = p.osc1_end_hz + (p.osc1_start_hz - p.osc1_end_hz) * pitch;
 
                 // Osc2 first — its current sample becomes osc1's FM input.
-                let f2 = (base_freq * p.osc2_ratio).max(0.0);
-                self.osc2_phase += f2 / sr;
+                let mod_freq = (base_freq * p.osc2_ratio).max(0.01);
+                self.osc2_phase += mod_freq / sr;
                 if self.osc2_phase >= 1.0 {
                     self.osc2_phase -= self.osc2_phase.floor();
                 }
                 let osc2 = wave_sample(p.osc2_wave, self.osc2_phase);
 
-                // Osc1 with FM from osc2.
-                let fm = osc2 * p.fm_amount * base_freq;
-                let f1 = (base_freq + fm).max(0.0);
+                // FM: deviation = mod_freq * index. Slider 0..1 → modulation
+                // index 0..10 (deep enough for clangy / bell-like tones).
+                let deviation = mod_freq * p.fm_amount * 10.0;
+                let f1 = (base_freq + osc2 * deviation).max(0.0);
                 self.osc1_phase += f1 / sr;
                 if self.osc1_phase >= 1.0 {
                     self.osc1_phase -= self.osc1_phase.floor();
@@ -850,9 +892,10 @@ impl BusDistortion {
         // so the harmonic content explodes (odd + even).
         let g2 = 1.0 + params.stage2_drive.clamp(0.0, 1.0) * 150.0;
         let bias = params.bias.clamp(0.0, 1.0) * 0.5;
-        let fb_amount = params.feedback.clamp(0.0, 0.95);
+        let fb_amount = params.feedback.clamp(0.0, 0.4);
         let gate_amt = params.gate.clamp(0.0, 1.0);
-        let gate_threshold = gate_amt * 0.4;
+        // Quadratic threshold so the lower half of the slider has finer control.
+        let gate_threshold = gate_amt * gate_amt * 0.7;
         let out_gain = params.output.clamp(0.0, 2.0);
 
         for s in io.iter_mut() {
@@ -872,20 +915,17 @@ impl BusDistortion {
             x = self.stage2_post.process(x);
 
             // Save tanh-bounded value as next sample's feedback source.
-            self.fb_state = (x * 0.95).tanh();
+            // Lower internal scaling so feedback ramps in smoothly across the slider.
+            self.fb_state = (x * 0.5).tanh();
 
-            // Optional sputter gate. Fast attack tracks the envelope; slower
-            // release lets the gate close between cycles when threshold is high.
+            // Optional sputter gate. Peak follower with fast 3%/sample release
+            // (~0.7 ms half-life at 44.1k) lets the envelope dip between waveform
+            // cycles, so a high threshold makes the gate flutter.
             if gate_amt > 0.001 {
                 let abs_x = x.abs();
-                if abs_x > self.gate_env {
-                    self.gate_env = abs_x;
-                } else {
-                    self.gate_env *= 0.995;
-                }
+                self.gate_env = (self.gate_env * 0.97).max(abs_x);
                 let target = if self.gate_env > gate_threshold { 1.0 } else { 0.0 };
-                // Smooth a little to soften the worst clicks without losing sputter.
-                self.gate_smooth += 0.3 * (target - self.gate_smooth);
+                self.gate_smooth += 0.5 * (target - self.gate_smooth);
                 x *= self.gate_smooth;
             }
 

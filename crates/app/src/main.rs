@@ -144,6 +144,8 @@ struct App {
     overdub_locks: [StepLocks; VOICES],
     /// Last current_step we observed; used to detect step transitions for overdub commit.
     last_step: Option<usize>,
+    /// Per-voice mute state (UI mirror of engine).
+    muted: [bool; VOICES],
 
     _stream: cpal::Stream, // hold to keep audio alive
 }
@@ -169,6 +171,7 @@ impl App {
             step_edited: [false; STEPS],
             overdub_locks: [StepLocks::default(); VOICES],
             last_step: None,
+            muted: [false; VOICES],
             _stream: stream,
         }
     }
@@ -324,7 +327,16 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::Key::*;
-        let step_keys = [Q, W, E, R, U, I, O, P, A, S, D, F, J, K, L, Semicolon];
+        // Suppress egui's default Tab focus navigation; we use Tab as a held
+        // modifier for mute toggling.
+        ctx.input_mut(|i| {
+            let _ = i.consume_key(egui::Modifiers::NONE, Tab);
+            let _ = i.consume_key(egui::Modifiers::SHIFT, Tab);
+        });
+
+        // Bars 1-2 land on the left hand (Q-R / A-F), bars 3-4 on the right
+        // (U-P / J-;). Steps 1-16 = Q W E R | A S D F | U I O P | J K L ;
+        let step_keys = [Q, W, E, R, A, S, D, F, U, I, O, P, J, K, L, Semicolon];
         let num_keys = [
             Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0,
         ];
@@ -336,6 +348,7 @@ impl App {
             shift_step_pressed,
             num_down,
             num_pressed,
+            tab_down,
             plain_space,
             shift_space,
         ) = ctx.input(|i| {
@@ -356,6 +369,7 @@ impl App {
                 num_down[idx] = i.key_down(*k);
                 num_pressed[idx] = i.key_pressed(*k);
             }
+            let tab_down = i.key_down(Tab);
             let space = i.key_pressed(Space);
             (
                 step_down,
@@ -363,6 +377,7 @@ impl App {
                 shift_step_pressed,
                 num_down,
                 num_pressed,
+                tab_down,
                 space && !shift,
                 space && shift,
             )
@@ -395,15 +410,27 @@ impl App {
         }
 
         // Number keys: tap = select voice; holding = enables overdub for that voice.
-        for v in 0..VOICES {
-            let was_held = self.held_voices[v];
-            self.held_voices[v] = num_down[v];
-            if num_pressed[v] {
-                self.selected_voice = v;
+        // Tab+number = toggle mute (skips both selection and overdub tracking).
+        if tab_down {
+            for v in 0..VOICES {
+                if num_pressed[v] {
+                    self.muted[v] = !self.muted[v];
+                    self.send(Command::SetVoiceMuted {
+                        voice: v,
+                        muted: self.muted[v],
+                    });
+                }
             }
-            if was_held && !num_down[v] {
-                // Released: clear overdub buffer for this voice.
-                self.overdub_locks[v] = StepLocks::default();
+        } else {
+            for v in 0..VOICES {
+                let was_held = self.held_voices[v];
+                self.held_voices[v] = num_down[v];
+                if num_pressed[v] {
+                    self.selected_voice = v;
+                }
+                if was_held && !num_down[v] {
+                    self.overdub_locks[v] = StepLocks::default();
+                }
             }
         }
 
@@ -529,6 +556,15 @@ fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
 const LOCK_COLOR: egui::Color32 = egui::Color32::BLACK;
 const MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 220, 100);
 
+fn dim(c: egui::Color32, factor: f32) -> egui::Color32 {
+    let f = factor.clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        (c.r() as f32 * f) as u8,
+        (c.g() as f32 * f) as u8,
+        (c.b() as f32 * f) as u8,
+    )
+}
+
 fn cell_color(on: bool, here: bool, selected: bool) -> egui::Color32 {
     match (on, here, selected) {
         (true, true, _) => egui::Color32::from_rgb(255, 210, 90),
@@ -613,7 +649,10 @@ impl App {
                     for s in 0..STEPS {
                         let on = self.pattern[v][s];
                         let here = playing && s == cur_step;
-                        let color = cell_color(on, here, is_sel);
+                        let mut color = cell_color(on, here, is_sel);
+                        if self.muted[v] {
+                            color = dim(color, 0.35);
+                        }
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(cell_w, cell_h),
                             egui::Sense::click(),
@@ -692,7 +731,7 @@ impl App {
                 x.bias = v;
                 dist_changed = true;
             });
-            slider(&mut cols[1], "feedback", x.feedback, 0.0..=0.95, false, x.feedback, |v| {
+            slider(&mut cols[1], "feedback", x.feedback, 0.0..=0.4, false, x.feedback, |v| {
                 x.feedback = v;
                 dist_changed = true;
             });
@@ -831,6 +870,7 @@ impl App {
                     (NoiseColor::White, "white"),
                     (NoiseColor::Pink, "pink"),
                     (NoiseColor::Grain, "grain"),
+                    (NoiseColor::Digital, "digital"),
                 ] {
                     if ui.selectable_value(&mut c, cc, lbl).clicked() {
                         edit = Some(FieldEdit::NoiseColor(cc));
@@ -933,7 +973,7 @@ impl App {
                     ui,
                     &[
                         (0..4, ["Q", "W", "E", "R"]),
-                        (8..12, ["A", "S", "D", "F"]),
+                        (4..8, ["A", "S", "D", "F"]),
                     ],
                 );
             });
@@ -948,7 +988,7 @@ impl App {
                 self.draw_focus_cluster(
                     ui,
                     &[
-                        (4..8, ["U", "I", "O", "P"]),
+                        (8..12, ["U", "I", "O", "P"]),
                         (12..16, ["J", "K", "L", ";"]),
                     ],
                 );

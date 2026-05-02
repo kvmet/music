@@ -34,6 +34,7 @@ pub enum Command {
     SetDelayParams(DelayParams),
     SetBusDistortionParams(BusDistortionParams),
     SetReverbParams(ReverbParams),
+    SetVoiceMuted { voice: usize, muted: bool },
     Play,
     Stop,
     StopAndRewind,
@@ -59,6 +60,7 @@ pub struct Engine {
     pattern: [[Step; STEPS]; VOICES],
     voices: Vec<DrumVoice>,
     voice_defaults: [DrumVoiceParams; VOICES],
+    muted: [bool; VOICES],
     // Mix routing scratch. Reused per buffer; grown lazily.
     voice_buf: Vec<f32>,
     mix_bus: Vec<f32>,
@@ -95,6 +97,7 @@ impl Engine {
             pattern: [[Step::default(); STEPS]; VOICES],
             voices,
             voice_defaults,
+            muted: [false; VOICES],
             voice_buf: Vec::new(),
             mix_bus: Vec::new(),
             delay_bus: Vec::new(),
@@ -204,6 +207,8 @@ impl Engine {
             };
             for s in &mut self.voice_buf[..len] { *s = 0.0; }
             self.voices[v_idx].render_add(&mut self.voice_buf[..len]);
+            // Mute is implemented in `fire_step` (skips new triggers). The
+            // voice still renders so any in-flight envelope decays naturally.
             for i in 0..len {
                 let s = self.voice_buf[i];
                 self.mix_bus[offset + i] += s;
@@ -219,6 +224,11 @@ impl Engine {
         for (v, voice) in self.voices.iter_mut().enumerate() {
             let s = &self.pattern[v][step_idx];
             if !s.on {
+                continue;
+            }
+            // Mute = skip new triggers; in-flight envelopes keep decaying
+            // naturally (no clicks).
+            if self.muted[v] {
                 continue;
             }
             // Always reapply (defaults + locks) so a locked step doesn't leave
@@ -271,6 +281,11 @@ impl Engine {
             Command::SetDelayParams(p) => self.delay_params = p,
             Command::SetBusDistortionParams(p) => self.bus_distortion_params = p,
             Command::SetReverbParams(p) => self.reverb_params = p,
+            Command::SetVoiceMuted { voice, muted } => {
+                if voice < VOICES {
+                    self.muted[voice] = muted;
+                }
+            }
             Command::Play => self.transport.play(),
             Command::Stop => self.transport.stop(),
             Command::StopAndRewind => {
