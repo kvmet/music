@@ -73,6 +73,12 @@ impl AdEnv {
     pub fn is_active(&self) -> bool {
         !matches!(self.state, AdState::Idle)
     }
+
+    pub fn set_rates(&mut self, attack_ms: f32, decay_ms: f32, sample_rate: u32) {
+        let sr = sample_rate as f32;
+        self.attack_inc = 1.0 / (attack_ms.max(0.01) / 1000.0 * sr);
+        self.decay_inc = 1.0 / (decay_ms.max(0.01) / 1000.0 * sr);
+    }
 }
 
 /// Decay-only envelope. 1 -> 0. Used for pitch sweeps.
@@ -97,11 +103,15 @@ impl DecayEnv {
         self.value = (self.value - self.decay_inc).max(0.0);
         self.value
     }
+
+    pub fn set_rate(&mut self, decay_ms: f32, sample_rate: u32) {
+        self.decay_inc = 1.0 / (decay_ms.max(0.01) / 1000.0 * sample_rate as f32);
+    }
 }
 
 // --- Filter ------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterMode {
     Off,
     LowPass,
@@ -122,6 +132,15 @@ impl OnePole {
         Self { a, z: 0.0, mode }
     }
 
+    pub fn set_cutoff(&mut self, cutoff_hz: f32, sample_rate: u32) {
+        let sr = sample_rate as f32;
+        self.a = (1.0 - (-TAU * cutoff_hz / sr).exp()).clamp(0.0, 1.0);
+    }
+
+    pub fn set_mode(&mut self, mode: FilterMode) {
+        self.mode = mode;
+    }
+
     pub fn process(&mut self, x: f32) -> f32 {
         match self.mode {
             FilterMode::Off => x,
@@ -139,7 +158,7 @@ impl OnePole {
 
 // --- Drum voice --------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DrumVoiceParams {
     pub tone_level: f32,
     pub tone_start_hz: f32,
@@ -158,6 +177,62 @@ pub struct DrumVoiceParams {
     pub click_ms: f32,
 
     pub master_gain: f32,
+}
+
+/// Per-step parameter overrides. None = inherit voice default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepLocks {
+    pub tone_level: Option<f32>,
+    pub tone_start_hz: Option<f32>,
+    pub tone_end_hz: Option<f32>,
+    pub tone_pitch_decay_ms: Option<f32>,
+    pub tone_amp_attack_ms: Option<f32>,
+    pub tone_amp_decay_ms: Option<f32>,
+    pub noise_level: Option<f32>,
+    pub noise_filter_hz: Option<f32>,
+    pub noise_filter_mode: Option<FilterMode>,
+    pub noise_amp_attack_ms: Option<f32>,
+    pub noise_amp_decay_ms: Option<f32>,
+    pub click_level: Option<f32>,
+    pub click_ms: Option<f32>,
+    pub master_gain: Option<f32>,
+}
+
+impl StepLocks {
+    pub fn is_empty(&self) -> bool {
+        self.tone_level.is_none()
+            && self.tone_start_hz.is_none()
+            && self.tone_end_hz.is_none()
+            && self.tone_pitch_decay_ms.is_none()
+            && self.tone_amp_attack_ms.is_none()
+            && self.tone_amp_decay_ms.is_none()
+            && self.noise_level.is_none()
+            && self.noise_filter_hz.is_none()
+            && self.noise_filter_mode.is_none()
+            && self.noise_amp_attack_ms.is_none()
+            && self.noise_amp_decay_ms.is_none()
+            && self.click_level.is_none()
+            && self.click_ms.is_none()
+            && self.master_gain.is_none()
+    }
+
+    /// Apply any locked fields onto `p`. Unlocked fields leave `p` untouched.
+    pub fn merge_into(&self, p: &mut DrumVoiceParams) {
+        if let Some(v) = self.tone_level { p.tone_level = v; }
+        if let Some(v) = self.tone_start_hz { p.tone_start_hz = v; }
+        if let Some(v) = self.tone_end_hz { p.tone_end_hz = v; }
+        if let Some(v) = self.tone_pitch_decay_ms { p.tone_pitch_decay_ms = v; }
+        if let Some(v) = self.tone_amp_attack_ms { p.tone_amp_attack_ms = v; }
+        if let Some(v) = self.tone_amp_decay_ms { p.tone_amp_decay_ms = v; }
+        if let Some(v) = self.noise_level { p.noise_level = v; }
+        if let Some(v) = self.noise_filter_hz { p.noise_filter_hz = v; }
+        if let Some(v) = self.noise_filter_mode { p.noise_filter_mode = v; }
+        if let Some(v) = self.noise_amp_attack_ms { p.noise_amp_attack_ms = v; }
+        if let Some(v) = self.noise_amp_decay_ms { p.noise_amp_decay_ms = v; }
+        if let Some(v) = self.click_level { p.click_level = v; }
+        if let Some(v) = self.click_ms { p.click_ms = v; }
+        if let Some(v) = self.master_gain { p.master_gain = v; }
+    }
 }
 
 impl Default for DrumVoiceParams {
@@ -226,6 +301,23 @@ impl DrumVoice {
         self.rng = x;
         (x as i32 as f32) / (i32::MAX as f32)
     }
+
+    pub fn params(&self) -> &DrumVoiceParams {
+        &self.params
+    }
+
+    /// Replace params and re-derive precomputed values (env increments,
+    /// filter coefficient, click length). Does NOT retrigger.
+    pub fn apply_params(&mut self, p: DrumVoiceParams) {
+        self.params = p;
+        let sr = self.sample_rate;
+        self.tone_amp.set_rates(p.tone_amp_attack_ms, p.tone_amp_decay_ms, sr);
+        self.tone_pitch.set_rate(p.tone_pitch_decay_ms, sr);
+        self.noise_amp.set_rates(p.noise_amp_attack_ms, p.noise_amp_decay_ms, sr);
+        self.noise_filter.set_cutoff(p.noise_filter_hz, sr);
+        self.noise_filter.set_mode(p.noise_filter_mode);
+        self.click_total = (p.click_ms / 1000.0 * sr as f32).max(0.0) as u32;
+    }
 }
 
 impl Voice for DrumVoice {
@@ -240,7 +332,7 @@ impl Voice for DrumVoice {
 
     fn render_add(&mut self, out: &mut [f32]) {
         let sr = self.sample_rate as f32;
-        let p = self.params.clone();
+        let p = self.params;
         for s in out.iter_mut() {
             let mut sample = 0.0;
 
@@ -280,186 +372,156 @@ impl Voice for DrumVoice {
 
 // --- Presets -----------------------------------------------------------------
 
-impl DrumVoice {
-    pub fn kick(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 1.0,
-                tone_start_hz: 130.0,
-                tone_end_hz: 50.0,
-                tone_pitch_decay_ms: 60.0,
-                tone_amp_attack_ms: 1.0,
-                tone_amp_decay_ms: 250.0,
-                click_level: 0.5,
-                click_ms: 1.5,
-                master_gain: 0.8,
-                ..Default::default()
-            },
-            sr,
-        )
+impl DrumVoiceParams {
+    pub fn kick() -> Self {
+        Self {
+            tone_level: 1.0,
+            tone_start_hz: 130.0,
+            tone_end_hz: 50.0,
+            tone_pitch_decay_ms: 60.0,
+            tone_amp_attack_ms: 1.0,
+            tone_amp_decay_ms: 250.0,
+            click_level: 0.5,
+            click_ms: 1.5,
+            master_gain: 0.8,
+            ..Default::default()
+        }
     }
 
-    pub fn snare(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 0.55,
-                tone_start_hz: 240.0,
-                tone_end_hz: 180.0,
-                tone_pitch_decay_ms: 25.0,
-                tone_amp_attack_ms: 1.0,
-                tone_amp_decay_ms: 90.0,
-                noise_level: 0.7,
-                noise_filter_hz: 1500.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 1.0,
-                noise_amp_decay_ms: 150.0,
-                click_level: 0.3,
-                click_ms: 1.0,
-                master_gain: 0.7,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn snare() -> Self {
+        Self {
+            tone_level: 0.55,
+            tone_start_hz: 240.0,
+            tone_end_hz: 180.0,
+            tone_pitch_decay_ms: 25.0,
+            tone_amp_attack_ms: 1.0,
+            tone_amp_decay_ms: 90.0,
+            noise_level: 0.7,
+            noise_filter_hz: 1500.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 1.0,
+            noise_amp_decay_ms: 150.0,
+            click_level: 0.3,
+            click_ms: 1.0,
+            master_gain: 0.7,
+            ..Default::default()
+        }
     }
 
-    pub fn closed_hat(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                noise_level: 0.9,
-                noise_filter_hz: 7000.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 1.0,
-                noise_amp_decay_ms: 35.0,
-                master_gain: 0.5,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn closed_hat() -> Self {
+        Self {
+            noise_level: 0.9,
+            noise_filter_hz: 7000.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 1.0,
+            noise_amp_decay_ms: 35.0,
+            master_gain: 0.5,
+            ..Default::default()
+        }
     }
 
-    pub fn open_hat(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                noise_level: 0.85,
-                noise_filter_hz: 6500.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 1.0,
-                noise_amp_decay_ms: 280.0,
-                master_gain: 0.45,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn open_hat() -> Self {
+        Self {
+            noise_level: 0.85,
+            noise_filter_hz: 6500.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 1.0,
+            noise_amp_decay_ms: 280.0,
+            master_gain: 0.45,
+            ..Default::default()
+        }
     }
 
-    pub fn tom_lo(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 1.0,
-                tone_start_hz: 140.0,
-                tone_end_hz: 90.0,
-                tone_pitch_decay_ms: 50.0,
-                tone_amp_attack_ms: 1.0,
-                tone_amp_decay_ms: 350.0,
-                click_level: 0.2,
-                click_ms: 1.0,
-                master_gain: 0.7,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn tom_lo() -> Self {
+        Self {
+            tone_level: 1.0,
+            tone_start_hz: 140.0,
+            tone_end_hz: 90.0,
+            tone_pitch_decay_ms: 50.0,
+            tone_amp_attack_ms: 1.0,
+            tone_amp_decay_ms: 350.0,
+            click_level: 0.2,
+            click_ms: 1.0,
+            master_gain: 0.7,
+            ..Default::default()
+        }
     }
 
-    pub fn tom_hi(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 1.0,
-                tone_start_hz: 230.0,
-                tone_end_hz: 160.0,
-                tone_pitch_decay_ms: 40.0,
-                tone_amp_attack_ms: 1.0,
-                tone_amp_decay_ms: 250.0,
-                click_level: 0.2,
-                click_ms: 1.0,
-                master_gain: 0.7,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn tom_hi() -> Self {
+        Self {
+            tone_level: 1.0,
+            tone_start_hz: 230.0,
+            tone_end_hz: 160.0,
+            tone_pitch_decay_ms: 40.0,
+            tone_amp_attack_ms: 1.0,
+            tone_amp_decay_ms: 250.0,
+            click_level: 0.2,
+            click_ms: 1.0,
+            master_gain: 0.7,
+            ..Default::default()
+        }
     }
 
-    pub fn clap(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                noise_level: 0.95,
-                noise_filter_hz: 1200.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 2.0,
-                noise_amp_decay_ms: 120.0,
-                master_gain: 0.55,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn clap() -> Self {
+        Self {
+            noise_level: 0.95,
+            noise_filter_hz: 1200.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 2.0,
+            noise_amp_decay_ms: 120.0,
+            master_gain: 0.55,
+            ..Default::default()
+        }
     }
 
-    pub fn rim(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 0.7,
-                tone_start_hz: 1200.0,
-                tone_end_hz: 800.0,
-                tone_pitch_decay_ms: 8.0,
-                tone_amp_attack_ms: 0.5,
-                tone_amp_decay_ms: 25.0,
-                click_level: 0.5,
-                click_ms: 0.6,
-                master_gain: 0.6,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn rim() -> Self {
+        Self {
+            tone_level: 0.7,
+            tone_start_hz: 1200.0,
+            tone_end_hz: 800.0,
+            tone_pitch_decay_ms: 8.0,
+            tone_amp_attack_ms: 0.5,
+            tone_amp_decay_ms: 25.0,
+            click_level: 0.5,
+            click_ms: 0.6,
+            master_gain: 0.6,
+            ..Default::default()
+        }
     }
 
-    pub fn perc_lo(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 0.9,
-                tone_start_hz: 400.0,
-                tone_end_hz: 300.0,
-                tone_pitch_decay_ms: 20.0,
-                tone_amp_attack_ms: 1.0,
-                tone_amp_decay_ms: 80.0,
-                noise_level: 0.2,
-                noise_filter_hz: 3000.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 1.0,
-                noise_amp_decay_ms: 60.0,
-                master_gain: 0.6,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn perc_lo() -> Self {
+        Self {
+            tone_level: 0.9,
+            tone_start_hz: 400.0,
+            tone_end_hz: 300.0,
+            tone_pitch_decay_ms: 20.0,
+            tone_amp_attack_ms: 1.0,
+            tone_amp_decay_ms: 80.0,
+            noise_level: 0.2,
+            noise_filter_hz: 3000.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 1.0,
+            noise_amp_decay_ms: 60.0,
+            master_gain: 0.6,
+            ..Default::default()
+        }
     }
 
-    pub fn perc_hi(sr: u32) -> Self {
-        Self::new(
-            DrumVoiceParams {
-                tone_level: 0.9,
-                tone_start_hz: 900.0,
-                tone_end_hz: 700.0,
-                tone_pitch_decay_ms: 12.0,
-                tone_amp_attack_ms: 0.5,
-                tone_amp_decay_ms: 50.0,
-                noise_level: 0.15,
-                noise_filter_hz: 5000.0,
-                noise_filter_mode: FilterMode::HighPass,
-                noise_amp_attack_ms: 0.5,
-                noise_amp_decay_ms: 40.0,
-                master_gain: 0.55,
-                ..Default::default()
-            },
-            sr,
-        )
+    pub fn perc_hi() -> Self {
+        Self {
+            tone_level: 0.9,
+            tone_start_hz: 900.0,
+            tone_end_hz: 700.0,
+            tone_pitch_decay_ms: 12.0,
+            tone_amp_attack_ms: 0.5,
+            tone_amp_decay_ms: 50.0,
+            noise_level: 0.15,
+            noise_filter_hz: 5000.0,
+            noise_filter_mode: FilterMode::HighPass,
+            noise_amp_attack_ms: 0.5,
+            noise_amp_decay_ms: 40.0,
+            master_gain: 0.55,
+            ..Default::default()
+        }
     }
 }

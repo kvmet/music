@@ -1,7 +1,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use synth::Voice;
+use synth::{DrumVoice, DrumVoiceParams, StepLocks, Voice};
 use transport::{PlaybackState, Position, Transport, TransportConfig};
 
 pub use crossbeam_channel::TrySendError;
@@ -11,9 +11,23 @@ pub const STEPS: usize = 16;
 pub const TICKS_PER_STEP: u64 = 240; // 16th note at 960 PPQ
 const COMMAND_CAPACITY: usize = 256;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Step {
+    pub on: bool,
+    pub locks: StepLocks,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
     SetStep { voice: usize, step: usize, on: bool },
+    /// Update the voice's default params AND apply them live.
+    SetVoiceParams { voice: usize, params: DrumVoiceParams },
+    /// Apply params to the voice live without changing the default.
+    /// Used for step-lock / overdub edits so an in-flight envelope responds.
+    /// The next trigger will reset to (defaults + step locks) anyway.
+    ApplyVoiceParams { voice: usize, params: DrumVoiceParams },
+    SetStepLocks { voice: usize, step: usize, locks: StepLocks },
+    ClearStepLocks { voice: usize, step: usize },
     Play,
     Stop,
     StopAndRewind,
@@ -33,13 +47,12 @@ impl Shared {
     }
 }
 
-pub type BoxedVoice = Box<dyn Voice + Send>;
-
-/// Lives on the audio thread. UI talks to it via `CommandSender`.
+/// Lives on the audio thread. UI talks to it via `Handle::commands`.
 pub struct Engine {
     transport: Transport,
-    pattern: [[bool; STEPS]; VOICES],
-    voices: Vec<BoxedVoice>,
+    pattern: [[Step; STEPS]; VOICES],
+    voices: Vec<DrumVoice>,
+    voice_defaults: [DrumVoiceParams; VOICES],
     rx: Receiver<Command>,
     shared: Arc<Shared>,
 }
@@ -50,17 +63,20 @@ pub struct Handle {
 }
 
 impl Engine {
-    pub fn new(sample_rate: u32, voices: Vec<BoxedVoice>) -> (Self, Handle) {
+    pub fn new(sample_rate: u32, voices: Vec<DrumVoice>) -> (Self, Handle) {
         assert_eq!(voices.len(), VOICES, "engine expects exactly {VOICES} voices");
         let (tx, rx) = bounded(COMMAND_CAPACITY);
         let shared = Arc::new(Shared {
             playhead_ticks: AtomicU64::new(0),
             playing: AtomicBool::new(false),
         });
+        let voice_defaults: [DrumVoiceParams; VOICES] =
+            std::array::from_fn(|i| *voices[i].params());
         let engine = Self {
             transport: Transport::new(TransportConfig::new(120, sample_rate)),
-            pattern: [[false; STEPS]; VOICES],
+            pattern: [[Step::default(); STEPS]; VOICES],
             voices,
+            voice_defaults,
             rx,
             shared: shared.clone(),
         };
@@ -123,11 +139,18 @@ impl Engine {
     }
 
     fn fire_step(&mut self, tick: u64) {
-        let step = ((tick / TICKS_PER_STEP) as usize) % STEPS;
+        let step_idx = ((tick / TICKS_PER_STEP) as usize) % STEPS;
         for (v, voice) in self.voices.iter_mut().enumerate() {
-            if self.pattern[v][step] {
-                voice.trigger(1.0);
+            let s = &self.pattern[v][step_idx];
+            if !s.on {
+                continue;
             }
+            // Always reapply (defaults + locks) so a locked step doesn't leave
+            // its overrides stuck on the voice for the next trigger.
+            let mut params = self.voice_defaults[v];
+            s.locks.merge_into(&mut params);
+            voice.apply_params(params);
+            voice.trigger(1.0);
         }
     }
 
@@ -145,7 +168,28 @@ impl Engine {
         match cmd {
             Command::SetStep { voice, step, on } => {
                 if voice < VOICES && step < STEPS {
-                    self.pattern[voice][step] = on;
+                    self.pattern[voice][step].on = on;
+                }
+            }
+            Command::SetVoiceParams { voice, params } => {
+                if voice < VOICES {
+                    self.voice_defaults[voice] = params;
+                    self.voices[voice].apply_params(params);
+                }
+            }
+            Command::ApplyVoiceParams { voice, params } => {
+                if voice < VOICES {
+                    self.voices[voice].apply_params(params);
+                }
+            }
+            Command::SetStepLocks { voice, step, locks } => {
+                if voice < VOICES && step < STEPS {
+                    self.pattern[voice][step].locks = locks;
+                }
+            }
+            Command::ClearStepLocks { voice, step } => {
+                if voice < VOICES && step < STEPS {
+                    self.pattern[voice][step].locks = StepLocks::default();
                 }
             }
             Command::Play => self.transport.play(),
