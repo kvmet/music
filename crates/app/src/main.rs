@@ -1,6 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use engine::{Command, Engine, Handle, STEPS, VOICES};
+use record::Recorder;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use synth::{
     BusDistortionParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode, NoiseColor,
@@ -146,6 +148,7 @@ struct App {
     last_step: Option<usize>,
     /// Per-voice mute state (UI mirror of engine).
     muted: [bool; VOICES],
+    recorder: Arc<Recorder>,
 
     _stream: cpal::Stream, // hold to keep audio alive
 }
@@ -155,6 +158,7 @@ impl App {
         handle: Handle,
         stream: cpal::Stream,
         voice_params: [DrumVoiceParams; VOICES],
+        recorder: Arc<Recorder>,
     ) -> Self {
         Self {
             handle,
@@ -172,6 +176,7 @@ impl App {
             overdub_locks: [StepLocks::default(); VOICES],
             last_step: None,
             muted: [false; VOICES],
+            recorder,
             _stream: stream,
         }
     }
@@ -679,6 +684,29 @@ impl App {
         });
     }
 
+    fn draw_record_button(&mut self, ui: &mut egui::Ui) {
+        let recording = self.recorder.is_recording();
+        if recording {
+            // red dot + "stop" label.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 4.0, egui::Color32::from_rgb(220, 60, 60));
+        }
+        let label = if recording { "Stop Rec" } else { "Record" };
+        if ui.button(label).clicked() {
+            if recording {
+                self.recorder.stop();
+            } else {
+                let path = record::default_filename(std::path::Path::new("."));
+                if let Err(e) = self.recorder.start(&path) {
+                    eprintln!("recorder start failed: {e}");
+                } else {
+                    eprintln!("recording to {}", path.display());
+                }
+            }
+        }
+    }
+
     fn draw_global_fx(&mut self, ui: &mut egui::Ui) {
         ui.columns(3, |cols| {
             // Delay
@@ -1022,6 +1050,8 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label(format!("Voice {}", self.selected_voice + 1));
+                ui.separator();
+                self.draw_record_button(ui);
             });
             ui.add_space(4.0);
         });
@@ -1051,7 +1081,7 @@ impl eframe::App for App {
     }
 }
 
-type Built = (Handle, cpal::Stream, [DrumVoiceParams; VOICES]);
+type Built = (Handle, cpal::Stream, [DrumVoiceParams; VOICES], Arc<Recorder>);
 
 fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -1082,6 +1112,9 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
         .collect();
     let (mut engine, handle) = Engine::new(sample_rate, voices);
 
+    let recorder = Arc::new(Recorder::new(sample_rate));
+    let recorder_audio = recorder.clone();
+
     let err_fn = |e| eprintln!("audio stream error: {e}");
     let mut mono_buf: Vec<f32> = Vec::new();
 
@@ -1095,6 +1128,8 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
                 }
                 let mono = &mut mono_buf[..frames];
                 engine.process(mono);
+                // Tap the mono signal for recording before duplicating to channels.
+                recorder_audio.push_samples(mono);
                 for (i, frame) in out.chunks_mut(channels).enumerate() {
                     for s in frame.iter_mut() {
                         *s = mono[i];
@@ -1108,15 +1143,15 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
     };
 
     stream.play()?;
-    Ok((handle, stream, presets))
+    Ok((handle, stream, presets, recorder))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (handle, stream, presets) = build_engine_and_stream()?;
+    let (handle, stream, presets, recorder) = build_engine_and_stream()?;
     eframe::run_native(
         "drum sequencer",
         eframe::NativeOptions::default(),
-        Box::new(move |_| Ok(Box::new(App::new(handle, stream, presets)))),
+        Box::new(move |_| Ok(Box::new(App::new(handle, stream, presets, recorder)))),
     )?;
     Ok(())
 }

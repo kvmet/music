@@ -10,3 +10,4 @@ egui = "0.34.1"
 transport = { workspace = true }
 synth = { workspace = true }
 engine = { workspace = true }
+record = { workspace = true }
