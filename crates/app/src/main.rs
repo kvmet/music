@@ -1,9 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use engine::{Command, Engine, Handle, STEPS, VOICES};
+use engine::{Command, Engine, Handle, SceneData, STEPS, VOICES};
 use record::Recorder;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+const NUM_SCENES: usize = 8;
+const SCENE_SAVE_HOLD_SECS: f32 = 2.0;
 use synth::{
     BusDistortionParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode, NoiseColor,
     ReverbParams, StepLocks, Wave,
@@ -148,6 +152,10 @@ struct App {
     last_step: Option<usize>,
     /// Per-voice mute state (UI mirror of engine).
     muted: [bool; VOICES],
+    /// Saved snapshots of the entire kit + global FX state.
+    scenes: [Option<SceneData>; NUM_SCENES],
+    /// (slot index, when the shift+hold started) — None if not currently saving.
+    save_holding: Option<(usize, Instant)>,
     recorder: Arc<Recorder>,
 
     _stream: cpal::Stream, // hold to keep audio alive
@@ -176,6 +184,8 @@ impl App {
             overdub_locks: [StepLocks::default(); VOICES],
             last_step: None,
             muted: [false; VOICES],
+            scenes: std::array::from_fn(|_| None),
+            save_holding: None,
             recorder,
             _stream: stream,
         }
@@ -332,11 +342,14 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         use egui::Key::*;
-        // Suppress egui's default Tab focus navigation; we use Tab as a held
-        // modifier for mute toggling.
+        // Suppress egui's Tab focus navigation; we use Tab as a held modifier
+        // for mute toggling. consume_key only matches one modifier combo at a
+        // time and only `pressed: true` events, so we strip Tab events from
+        // the queue directly. key_down(Tab) keeps working since it reads the
+        // keys-down state, which is maintained separately from the event list.
         ctx.input_mut(|i| {
-            let _ = i.consume_key(egui::Modifiers::NONE, Tab);
-            let _ = i.consume_key(egui::Modifiers::SHIFT, Tab);
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }));
         });
 
         // Bars 1-2 land on the left hand (Q-R / A-F), bars 3-4 on the right
@@ -682,6 +695,128 @@ impl App {
                 });
             }
         });
+    }
+
+    fn snapshot_scene(&self) -> SceneData {
+        SceneData {
+            voice_params: self.voice_params,
+            pattern: self.pattern,
+            locks: self.locks,
+            muted: self.muted,
+            millibpm: self.bpm * 1000,
+            delay: self.delay_params,
+            distortion: self.bus_distortion_params,
+            reverb: self.reverb_params,
+        }
+    }
+
+    fn recall_scene(&mut self, idx: usize) {
+        let Some(scene) = self.scenes[idx].clone() else {
+            return;
+        };
+        // Update local mirrors so the UI reflects the new state immediately.
+        self.voice_params = scene.voice_params;
+        self.pattern = scene.pattern;
+        self.locks = scene.locks;
+        self.muted = scene.muted;
+        self.bpm = scene.millibpm / 1000;
+        self.delay_params = scene.delay;
+        self.bus_distortion_params = scene.distortion;
+        self.reverb_params = scene.reverb;
+        // Apply atomically on the audio side via a single LoadScene command.
+        self.send(Command::LoadScene(Box::new(scene)));
+    }
+
+    fn draw_scene_buttons(&mut self, ui: &mut egui::Ui) {
+        let shift = ui.input(|i| i.modifiers.shift);
+        let mut newly_holding: Option<usize> = None;
+        let mut release_holding = false;
+        let mut to_save: Option<usize> = None;
+        let mut to_recall: Option<usize> = None;
+
+        for idx in 0..NUM_SCENES {
+            let size = egui::vec2(26.0, 22.0);
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+
+            let filled = self.scenes[idx].is_some();
+            let bg = if filled {
+                egui::Color32::from_rgb(70, 90, 120)
+            } else {
+                egui::Color32::from_rgb(45, 45, 50)
+            };
+            let bg = if resp.hovered() {
+                egui::Color32::from_rgb(
+                    (bg.r() as u16 + 20).min(255) as u8,
+                    (bg.g() as u16 + 20).min(255) as u8,
+                    (bg.b() as u16 + 20).min(255) as u8,
+                )
+            } else {
+                bg
+            };
+            ui.painter().rect_filled(rect, 3.0, bg);
+
+            // Save-hold progress overlay (only on the slot being held).
+            if let Some((i, start)) = self.save_holding {
+                if i == idx {
+                    let progress =
+                        (start.elapsed().as_secs_f32() / SCENE_SAVE_HOLD_SECS).clamp(0.0, 1.0);
+                    let fill_h = rect.height() * progress;
+                    let fill_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - fill_h),
+                        rect.max,
+                    );
+                    ui.painter().rect_filled(
+                        fill_rect,
+                        3.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 220, 100, 110),
+                    );
+                }
+            }
+
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}", idx + 1),
+                egui::FontId::proportional(13.0),
+                egui::Color32::WHITE,
+            );
+
+            // Save (shift + held) — track per-slot holding state.
+            let down_on = resp.is_pointer_button_down_on();
+            if shift && down_on {
+                if !matches!(self.save_holding, Some((i, _)) if i == idx) {
+                    newly_holding = Some(idx);
+                }
+            } else if matches!(self.save_holding, Some((i, _)) if i == idx) {
+                release_holding = true;
+            }
+
+            // Threshold reached → save.
+            if let Some((i, start)) = self.save_holding {
+                if i == idx && start.elapsed().as_secs_f32() >= SCENE_SAVE_HOLD_SECS {
+                    to_save = Some(idx);
+                }
+            }
+
+            // Plain click (no shift held at release) on a filled slot = recall.
+            if resp.clicked() && !ui.input(|i| i.modifiers.shift) && filled {
+                to_recall = Some(idx);
+            }
+        }
+
+        if let Some(i) = newly_holding {
+            self.save_holding = Some((i, Instant::now()));
+        }
+        if release_holding {
+            self.save_holding = None;
+        }
+        if let Some(i) = to_save {
+            self.scenes[i] = Some(self.snapshot_scene());
+            self.save_holding = None;
+        }
+        if let Some(i) = to_recall {
+            self.recall_scene(i);
+        }
     }
 
     fn draw_record_button(&mut self, ui: &mut egui::Ui) {
@@ -1052,6 +1187,9 @@ impl eframe::App for App {
                 ui.label(format!("Voice {}", self.selected_voice + 1));
                 ui.separator();
                 self.draw_record_button(ui);
+                ui.separator();
+                ui.label("Scenes");
+                self.draw_scene_buttons(ui);
             });
             ui.add_space(4.0);
         });

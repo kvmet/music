@@ -20,7 +20,20 @@ pub struct Step {
     pub locks: StepLocks,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Full snapshot of engine-side state — used for scene save/recall.
+#[derive(Clone, Debug)]
+pub struct SceneData {
+    pub voice_params: [DrumVoiceParams; VOICES],
+    pub pattern: [[bool; STEPS]; VOICES],
+    pub locks: [[StepLocks; STEPS]; VOICES],
+    pub muted: [bool; VOICES],
+    pub millibpm: u32,
+    pub delay: DelayParams,
+    pub distortion: BusDistortionParams,
+    pub reverb: ReverbParams,
+}
+
+#[derive(Debug, Clone)]
 pub enum Command {
     SetStep { voice: usize, step: usize, on: bool },
     /// Update the voice's default params AND apply them live.
@@ -35,6 +48,9 @@ pub enum Command {
     SetBusDistortionParams(BusDistortionParams),
     SetReverbParams(ReverbParams),
     SetVoiceMuted { voice: usize, muted: bool },
+    /// Atomically replace pattern, locks, voice params, mutes, tempo, and
+    /// global FX from a saved scene.
+    LoadScene(Box<SceneData>),
     Play,
     Stop,
     StopAndRewind,
@@ -285,6 +301,26 @@ impl Engine {
                 if voice < VOICES {
                     self.muted[voice] = muted;
                 }
+            }
+            Command::LoadScene(scene) => {
+                let s = *scene;
+                self.voice_defaults = s.voice_params;
+                for v in 0..VOICES {
+                    self.voices[v].apply_params(s.voice_params[v]);
+                }
+                for v in 0..VOICES {
+                    for st in 0..STEPS {
+                        self.pattern[v][st] = Step {
+                            on: s.pattern[v][st],
+                            locks: s.locks[v][st],
+                        };
+                    }
+                }
+                self.muted = s.muted;
+                self.transport.set_tempo(s.millibpm);
+                self.delay_params = s.delay;
+                self.bus_distortion_params = s.distortion;
+                self.reverb_params = s.reverb;
             }
             Command::Play => self.transport.play(),
             Command::Stop => self.transport.stop(),
