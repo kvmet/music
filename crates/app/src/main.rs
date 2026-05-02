@@ -2,7 +2,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use engine::{Command, Engine, Handle, STEPS, VOICES};
 use std::sync::atomic::Ordering;
-use synth::{DrumVoice, DrumVoiceParams, FilterMode, StepLocks};
+use synth::{
+    BusDistortionParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode, NoiseColor,
+    ReverbParams, StepLocks, Wave,
+};
 
 const VOICE_NAMES: [&str; VOICES] = [
     "kick", "snare", "closed hat", "open hat", "tom lo", "tom hi", "clap", "rim",
@@ -23,19 +26,23 @@ enum EditTarget {
 /// One slider change → one of these.
 #[derive(Clone, Copy, Debug)]
 enum FieldEdit {
-    ToneLevel(f32),
-    ToneStartHz(f32),
-    ToneEndHz(f32),
-    TonePitchDecayMs(f32),
-    ToneAmpAttackMs(f32),
-    ToneAmpDecayMs(f32),
+    Osc1Wave(Wave),
+    Osc1Level(f32),
+    Osc1StartHz(f32),
+    Osc1EndHz(f32),
+    Osc1PitchDecayMs(f32),
+    Osc1AmpAttackMs(f32),
+    Osc1AmpDecayMs(f32),
+    Osc2Wave(Wave),
+    Osc2Level(f32),
+    Osc2Ratio(f32),
+    FmAmount(f32),
+    NoiseColor(NoiseColor),
     NoiseLevel(f32),
     NoiseFilterHz(f32),
     NoiseFilterMode(FilterMode),
     NoiseAmpAttackMs(f32),
     NoiseAmpDecayMs(f32),
-    ClickLevel(f32),
-    ClickMs(f32),
     Drive(f32),
     Fold(f32),
     Crush(f32),
@@ -43,25 +50,32 @@ enum FieldEdit {
     PostFilterHz(f32),
     PostFilterQ(f32),
     PostFilterMode(FilterMode),
+    SendDelay(f32),
+    SendReverb(f32),
+    SendDistortion(f32),
     MasterGain(f32),
 }
 
 impl FieldEdit {
     fn apply_to_params(self, p: &mut DrumVoiceParams) {
         match self {
-            FieldEdit::ToneLevel(v) => p.tone_level = v,
-            FieldEdit::ToneStartHz(v) => p.tone_start_hz = v,
-            FieldEdit::ToneEndHz(v) => p.tone_end_hz = v,
-            FieldEdit::TonePitchDecayMs(v) => p.tone_pitch_decay_ms = v,
-            FieldEdit::ToneAmpAttackMs(v) => p.tone_amp_attack_ms = v,
-            FieldEdit::ToneAmpDecayMs(v) => p.tone_amp_decay_ms = v,
+            FieldEdit::Osc1Wave(v) => p.osc1_wave = v,
+            FieldEdit::Osc1Level(v) => p.osc1_level = v,
+            FieldEdit::Osc1StartHz(v) => p.osc1_start_hz = v,
+            FieldEdit::Osc1EndHz(v) => p.osc1_end_hz = v,
+            FieldEdit::Osc1PitchDecayMs(v) => p.osc1_pitch_decay_ms = v,
+            FieldEdit::Osc1AmpAttackMs(v) => p.osc1_amp_attack_ms = v,
+            FieldEdit::Osc1AmpDecayMs(v) => p.osc1_amp_decay_ms = v,
+            FieldEdit::Osc2Wave(v) => p.osc2_wave = v,
+            FieldEdit::Osc2Level(v) => p.osc2_level = v,
+            FieldEdit::Osc2Ratio(v) => p.osc2_ratio = v,
+            FieldEdit::FmAmount(v) => p.fm_amount = v,
+            FieldEdit::NoiseColor(v) => p.noise_color = v,
             FieldEdit::NoiseLevel(v) => p.noise_level = v,
             FieldEdit::NoiseFilterHz(v) => p.noise_filter_hz = v,
             FieldEdit::NoiseFilterMode(v) => p.noise_filter_mode = v,
             FieldEdit::NoiseAmpAttackMs(v) => p.noise_amp_attack_ms = v,
             FieldEdit::NoiseAmpDecayMs(v) => p.noise_amp_decay_ms = v,
-            FieldEdit::ClickLevel(v) => p.click_level = v,
-            FieldEdit::ClickMs(v) => p.click_ms = v,
             FieldEdit::Drive(v) => p.drive = v,
             FieldEdit::Fold(v) => p.fold = v,
             FieldEdit::Crush(v) => p.crush = v,
@@ -69,25 +83,32 @@ impl FieldEdit {
             FieldEdit::PostFilterHz(v) => p.post_filter_hz = v,
             FieldEdit::PostFilterQ(v) => p.post_filter_q = v,
             FieldEdit::PostFilterMode(v) => p.post_filter_mode = v,
+            FieldEdit::SendDelay(v) => p.send_delay = v,
+            FieldEdit::SendReverb(v) => p.send_reverb = v,
+            FieldEdit::SendDistortion(v) => p.send_distortion = v,
             FieldEdit::MasterGain(v) => p.master_gain = v,
         }
     }
 
     fn apply_to_locks(self, l: &mut StepLocks) {
         match self {
-            FieldEdit::ToneLevel(v) => l.tone_level = Some(v),
-            FieldEdit::ToneStartHz(v) => l.tone_start_hz = Some(v),
-            FieldEdit::ToneEndHz(v) => l.tone_end_hz = Some(v),
-            FieldEdit::TonePitchDecayMs(v) => l.tone_pitch_decay_ms = Some(v),
-            FieldEdit::ToneAmpAttackMs(v) => l.tone_amp_attack_ms = Some(v),
-            FieldEdit::ToneAmpDecayMs(v) => l.tone_amp_decay_ms = Some(v),
+            FieldEdit::Osc1Wave(v) => l.osc1_wave = Some(v),
+            FieldEdit::Osc1Level(v) => l.osc1_level = Some(v),
+            FieldEdit::Osc1StartHz(v) => l.osc1_start_hz = Some(v),
+            FieldEdit::Osc1EndHz(v) => l.osc1_end_hz = Some(v),
+            FieldEdit::Osc1PitchDecayMs(v) => l.osc1_pitch_decay_ms = Some(v),
+            FieldEdit::Osc1AmpAttackMs(v) => l.osc1_amp_attack_ms = Some(v),
+            FieldEdit::Osc1AmpDecayMs(v) => l.osc1_amp_decay_ms = Some(v),
+            FieldEdit::Osc2Wave(v) => l.osc2_wave = Some(v),
+            FieldEdit::Osc2Level(v) => l.osc2_level = Some(v),
+            FieldEdit::Osc2Ratio(v) => l.osc2_ratio = Some(v),
+            FieldEdit::FmAmount(v) => l.fm_amount = Some(v),
+            FieldEdit::NoiseColor(v) => l.noise_color = Some(v),
             FieldEdit::NoiseLevel(v) => l.noise_level = Some(v),
             FieldEdit::NoiseFilterHz(v) => l.noise_filter_hz = Some(v),
             FieldEdit::NoiseFilterMode(v) => l.noise_filter_mode = Some(v),
             FieldEdit::NoiseAmpAttackMs(v) => l.noise_amp_attack_ms = Some(v),
             FieldEdit::NoiseAmpDecayMs(v) => l.noise_amp_decay_ms = Some(v),
-            FieldEdit::ClickLevel(v) => l.click_level = Some(v),
-            FieldEdit::ClickMs(v) => l.click_ms = Some(v),
             FieldEdit::Drive(v) => l.drive = Some(v),
             FieldEdit::Fold(v) => l.fold = Some(v),
             FieldEdit::Crush(v) => l.crush = Some(v),
@@ -95,6 +116,9 @@ impl FieldEdit {
             FieldEdit::PostFilterHz(v) => l.post_filter_hz = Some(v),
             FieldEdit::PostFilterQ(v) => l.post_filter_q = Some(v),
             FieldEdit::PostFilterMode(v) => l.post_filter_mode = Some(v),
+            FieldEdit::SendDelay(v) => l.send_delay = Some(v),
+            FieldEdit::SendReverb(v) => l.send_reverb = Some(v),
+            FieldEdit::SendDistortion(v) => l.send_distortion = Some(v),
             FieldEdit::MasterGain(v) => l.master_gain = Some(v),
         }
     }
@@ -105,6 +129,9 @@ struct App {
     pattern: [[bool; STEPS]; VOICES], // UI mirror; engine has authoritative copy.
     voice_params: [DrumVoiceParams; VOICES], // UI mirror of synth voice defaults.
     locks: [[StepLocks; STEPS]; VOICES], // UI mirror of step locks.
+    delay_params: DelayParams,
+    bus_distortion_params: BusDistortionParams,
+    reverb_params: ReverbParams,
     selected_voice: usize,
     bpm: u32,
 
@@ -132,6 +159,9 @@ impl App {
             pattern: [[false; STEPS]; VOICES],
             voice_params,
             locks: [[StepLocks::default(); STEPS]; VOICES],
+            delay_params: DelayParams::default(),
+            bus_distortion_params: BusDistortionParams::default(),
+            reverb_params: ReverbParams::default(),
             selected_voice: 0,
             bpm: 120,
             held_steps: [false; STEPS],
@@ -466,19 +496,23 @@ fn marker_shape(
 
 /// Copy any Some fields from `src` into `target`, leaving target's other fields alone.
 fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
-    if src.tone_level.is_some() { target.tone_level = src.tone_level; }
-    if src.tone_start_hz.is_some() { target.tone_start_hz = src.tone_start_hz; }
-    if src.tone_end_hz.is_some() { target.tone_end_hz = src.tone_end_hz; }
-    if src.tone_pitch_decay_ms.is_some() { target.tone_pitch_decay_ms = src.tone_pitch_decay_ms; }
-    if src.tone_amp_attack_ms.is_some() { target.tone_amp_attack_ms = src.tone_amp_attack_ms; }
-    if src.tone_amp_decay_ms.is_some() { target.tone_amp_decay_ms = src.tone_amp_decay_ms; }
+    if src.osc1_wave.is_some() { target.osc1_wave = src.osc1_wave; }
+    if src.osc1_level.is_some() { target.osc1_level = src.osc1_level; }
+    if src.osc1_start_hz.is_some() { target.osc1_start_hz = src.osc1_start_hz; }
+    if src.osc1_end_hz.is_some() { target.osc1_end_hz = src.osc1_end_hz; }
+    if src.osc1_pitch_decay_ms.is_some() { target.osc1_pitch_decay_ms = src.osc1_pitch_decay_ms; }
+    if src.osc1_amp_attack_ms.is_some() { target.osc1_amp_attack_ms = src.osc1_amp_attack_ms; }
+    if src.osc1_amp_decay_ms.is_some() { target.osc1_amp_decay_ms = src.osc1_amp_decay_ms; }
+    if src.osc2_wave.is_some() { target.osc2_wave = src.osc2_wave; }
+    if src.osc2_level.is_some() { target.osc2_level = src.osc2_level; }
+    if src.osc2_ratio.is_some() { target.osc2_ratio = src.osc2_ratio; }
+    if src.fm_amount.is_some() { target.fm_amount = src.fm_amount; }
+    if src.noise_color.is_some() { target.noise_color = src.noise_color; }
     if src.noise_level.is_some() { target.noise_level = src.noise_level; }
     if src.noise_filter_hz.is_some() { target.noise_filter_hz = src.noise_filter_hz; }
     if src.noise_filter_mode.is_some() { target.noise_filter_mode = src.noise_filter_mode; }
     if src.noise_amp_attack_ms.is_some() { target.noise_amp_attack_ms = src.noise_amp_attack_ms; }
     if src.noise_amp_decay_ms.is_some() { target.noise_amp_decay_ms = src.noise_amp_decay_ms; }
-    if src.click_level.is_some() { target.click_level = src.click_level; }
-    if src.click_ms.is_some() { target.click_ms = src.click_ms; }
     if src.drive.is_some() { target.drive = src.drive; }
     if src.fold.is_some() { target.fold = src.fold; }
     if src.crush.is_some() { target.crush = src.crush; }
@@ -486,6 +520,9 @@ fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
     if src.post_filter_hz.is_some() { target.post_filter_hz = src.post_filter_hz; }
     if src.post_filter_q.is_some() { target.post_filter_q = src.post_filter_q; }
     if src.post_filter_mode.is_some() { target.post_filter_mode = src.post_filter_mode; }
+    if src.send_delay.is_some() { target.send_delay = src.send_delay; }
+    if src.send_reverb.is_some() { target.send_reverb = src.send_reverb; }
+    if src.send_distortion.is_some() { target.send_distortion = src.send_distortion; }
     if src.master_gain.is_some() { target.master_gain = src.master_gain; }
 }
 
@@ -603,6 +640,99 @@ impl App {
         });
     }
 
+    fn draw_global_fx(&mut self, ui: &mut egui::Ui) {
+        ui.columns(3, |cols| {
+            // Delay
+            cols[0].label(egui::RichText::new("Delay").strong());
+            let mut d = self.delay_params;
+            let mut delay_changed = false;
+            slider(&mut cols[0], "time ms", d.time_ms, 5.0..=2000.0, true, d.time_ms, |v| {
+                d.time_ms = v;
+                delay_changed = true;
+            });
+            slider(&mut cols[0], "feedback", d.feedback, 0.0..=0.95, false, d.feedback, |v| {
+                d.feedback = v;
+                delay_changed = true;
+            });
+            slider(&mut cols[0], "tone hz", d.lpf_hz, 200.0..=16000.0, true, d.lpf_hz, |v| {
+                d.lpf_hz = v;
+                delay_changed = true;
+            });
+            if delay_changed {
+                self.delay_params = d;
+                self.send(Command::SetDelayParams(d));
+            }
+
+            // Distortion
+            cols[1].label(egui::RichText::new("Distortion").strong());
+            let mut x = self.bus_distortion_params;
+            let mut dist_changed = false;
+            cols[1].label("stage 1 (soft)");
+            slider(&mut cols[1], "drive", x.stage1_drive, 0.0..=1.0, false, x.stage1_drive, |v| {
+                x.stage1_drive = v;
+                dist_changed = true;
+            });
+            slider(&mut cols[1], "tone", x.stage1_tone, 0.0..=1.0, false, x.stage1_tone, |v| {
+                x.stage1_tone = v;
+                dist_changed = true;
+            });
+            cols[1].add_space(6.0);
+            cols[1].label("stage 2 (hard)");
+            slider(&mut cols[1], "drive", x.stage2_drive, 0.0..=1.0, false, x.stage2_drive, |v| {
+                x.stage2_drive = v;
+                dist_changed = true;
+            });
+            slider(&mut cols[1], "tone", x.stage2_tone, 0.0..=1.0, false, x.stage2_tone, |v| {
+                x.stage2_tone = v;
+                dist_changed = true;
+            });
+            cols[1].add_space(6.0);
+            cols[1].label("nasty");
+            slider(&mut cols[1], "bias", x.bias, 0.0..=1.0, false, x.bias, |v| {
+                x.bias = v;
+                dist_changed = true;
+            });
+            slider(&mut cols[1], "feedback", x.feedback, 0.0..=0.95, false, x.feedback, |v| {
+                x.feedback = v;
+                dist_changed = true;
+            });
+            slider(&mut cols[1], "gate", x.gate, 0.0..=1.0, false, x.gate, |v| {
+                x.gate = v;
+                dist_changed = true;
+            });
+            cols[1].add_space(6.0);
+            slider(&mut cols[1], "output", x.output, 0.0..=2.0, false, x.output, |v| {
+                x.output = v;
+                dist_changed = true;
+            });
+            if dist_changed {
+                self.bus_distortion_params = x;
+                self.send(Command::SetBusDistortionParams(x));
+            }
+
+            // Reverb
+            cols[2].label(egui::RichText::new("Reverb").strong());
+            let mut r = self.reverb_params;
+            let mut rev_changed = false;
+            slider(&mut cols[2], "size", r.size, 0.0..=1.0, false, r.size, |v| {
+                r.size = v;
+                rev_changed = true;
+            });
+            slider(&mut cols[2], "damp", r.damp, 0.0..=1.0, false, r.damp, |v| {
+                r.damp = v;
+                rev_changed = true;
+            });
+            slider(&mut cols[2], "output", r.output, 0.0..=2.0, false, r.output, |v| {
+                r.output = v;
+                rev_changed = true;
+            });
+            if rev_changed {
+                self.reverb_params = r;
+                self.send(Command::SetReverbParams(r));
+            }
+        });
+    }
+
     fn draw_param_editor(&mut self, ui: &mut egui::Ui) {
         let target = self.editor_target();
         let display_voice = match target {
@@ -632,55 +762,93 @@ impl App {
         let mut edit: Option<FieldEdit> = None;
 
         ui.columns(3, |cols| {
-            // Tone
-            cols[0].label(egui::RichText::new("Tone").strong());
-            slider(&mut cols[0], "level", p.tone_level, 0.0..=1.0, false, mp.tone_level, |v| {
-                edit = Some(FieldEdit::ToneLevel(v));
+            // ===== Col 0: Osc 1 + Osc 2 + FM =====
+            cols[0].label(egui::RichText::new("Osc 1").strong());
+            cols[0].horizontal(|ui| {
+                ui.label("wave");
+                let mut w = p.osc1_wave;
+                for (ww, lbl) in [
+                    (Wave::Sine, "sin"),
+                    (Wave::Triangle, "tri"),
+                    (Wave::Saw, "saw"),
+                    (Wave::Square, "sq"),
+                ] {
+                    if ui.selectable_value(&mut w, ww, lbl).clicked() {
+                        edit = Some(FieldEdit::Osc1Wave(ww));
+                    }
+                }
             });
-            slider(&mut cols[0], "start hz", p.tone_start_hz, 20.0..=4000.0, true, mp.tone_start_hz, |v| {
-                edit = Some(FieldEdit::ToneStartHz(v));
+            slider(&mut cols[0], "level", p.osc1_level, 0.0..=1.0, false, mp.osc1_level, |v| {
+                edit = Some(FieldEdit::Osc1Level(v));
             });
-            slider(&mut cols[0], "end hz", p.tone_end_hz, 20.0..=4000.0, true, mp.tone_end_hz, |v| {
-                edit = Some(FieldEdit::ToneEndHz(v));
+            slider(&mut cols[0], "start hz", p.osc1_start_hz, 20.0..=4000.0, true, mp.osc1_start_hz, |v| {
+                edit = Some(FieldEdit::Osc1StartHz(v));
             });
-            slider(&mut cols[0], "pitch decay ms", p.tone_pitch_decay_ms, 0.5..=1000.0, true, mp.tone_pitch_decay_ms, |v| {
-                edit = Some(FieldEdit::TonePitchDecayMs(v));
+            slider(&mut cols[0], "end hz", p.osc1_end_hz, 20.0..=4000.0, true, mp.osc1_end_hz, |v| {
+                edit = Some(FieldEdit::Osc1EndHz(v));
             });
-            slider(&mut cols[0], "attack ms", p.tone_amp_attack_ms, 0.1..=200.0, true, mp.tone_amp_attack_ms, |v| {
-                edit = Some(FieldEdit::ToneAmpAttackMs(v));
+            slider(&mut cols[0], "pitch decay ms", p.osc1_pitch_decay_ms, 0.5..=1000.0, true, mp.osc1_pitch_decay_ms, |v| {
+                edit = Some(FieldEdit::Osc1PitchDecayMs(v));
             });
-            slider(&mut cols[0], "decay ms", p.tone_amp_decay_ms, 1.0..=2000.0, true, mp.tone_amp_decay_ms, |v| {
-                edit = Some(FieldEdit::ToneAmpDecayMs(v));
+            slider(&mut cols[0], "attack ms", p.osc1_amp_attack_ms, 0.1..=200.0, true, mp.osc1_amp_attack_ms, |v| {
+                edit = Some(FieldEdit::Osc1AmpAttackMs(v));
+            });
+            slider(&mut cols[0], "decay ms", p.osc1_amp_decay_ms, 1.0..=2000.0, true, mp.osc1_amp_decay_ms, |v| {
+                edit = Some(FieldEdit::Osc1AmpDecayMs(v));
             });
             cols[0].add_space(12.0);
-            cols[0].label(egui::RichText::new("FX").strong());
-            slider(&mut cols[0], "drive", p.drive, 0.0..=1.0, false, mp.drive, |v| {
-                edit = Some(FieldEdit::Drive(v));
+            cols[0].label(egui::RichText::new("Osc 2").strong());
+            cols[0].horizontal(|ui| {
+                ui.label("wave");
+                let mut w = p.osc2_wave;
+                for (ww, lbl) in [
+                    (Wave::Sine, "sin"),
+                    (Wave::Triangle, "tri"),
+                    (Wave::Saw, "saw"),
+                    (Wave::Square, "sq"),
+                ] {
+                    if ui.selectable_value(&mut w, ww, lbl).clicked() {
+                        edit = Some(FieldEdit::Osc2Wave(ww));
+                    }
+                }
             });
-            slider(&mut cols[0], "fold", p.fold, 0.0..=1.0, false, mp.fold, |v| {
-                edit = Some(FieldEdit::Fold(v));
+            slider(&mut cols[0], "level", p.osc2_level, 0.0..=1.0, false, mp.osc2_level, |v| {
+                edit = Some(FieldEdit::Osc2Level(v));
             });
-            slider(&mut cols[0], "crush", p.crush, 0.0..=1.0, false, mp.crush, |v| {
-                edit = Some(FieldEdit::Crush(v));
+            slider(&mut cols[0], "ratio", p.osc2_ratio, 0.25..=8.0, true, mp.osc2_ratio, |v| {
+                edit = Some(FieldEdit::Osc2Ratio(v));
             });
-            slider(&mut cols[0], "srr", p.srr, 0.0..=1.0, false, mp.srr, |v| {
-                edit = Some(FieldEdit::Srr(v));
+            slider(&mut cols[0], "fm", p.fm_amount, 0.0..=1.0, false, mp.fm_amount, |v| {
+                edit = Some(FieldEdit::FmAmount(v));
             });
 
-            // Noise
+            // ===== Col 1: Noise =====
             cols[1].label(egui::RichText::new("Noise").strong());
+            cols[1].horizontal(|ui| {
+                ui.label("color");
+                let mut c = p.noise_color;
+                for (cc, lbl) in [
+                    (NoiseColor::White, "white"),
+                    (NoiseColor::Pink, "pink"),
+                    (NoiseColor::Grain, "grain"),
+                ] {
+                    if ui.selectable_value(&mut c, cc, lbl).clicked() {
+                        edit = Some(FieldEdit::NoiseColor(cc));
+                    }
+                }
+            });
             slider(&mut cols[1], "level", p.noise_level, 0.0..=1.0, false, mp.noise_level, |v| {
                 edit = Some(FieldEdit::NoiseLevel(v));
             });
             cols[1].horizontal(|ui| {
                 ui.label("filter");
                 let mut mode = p.noise_filter_mode;
-                for (mm, label) in [
+                for (mm, lbl) in [
                     (FilterMode::Off, "off"),
                     (FilterMode::LowPass, "lp"),
                     (FilterMode::HighPass, "hp"),
                 ] {
-                    if ui.selectable_value(&mut mode, mm, label).clicked() {
+                    if ui.selectable_value(&mut mode, mm, lbl).clicked() {
                         edit = Some(FieldEdit::NoiseFilterMode(mm));
                     }
                 }
@@ -695,31 +863,32 @@ impl App {
                 edit = Some(FieldEdit::NoiseAmpDecayMs(v));
             });
 
-            // Click + Master
-            cols[2].label(egui::RichText::new("Click").strong());
-            slider(&mut cols[2], "level", p.click_level, 0.0..=1.0, false, mp.click_level, |v| {
-                edit = Some(FieldEdit::ClickLevel(v));
+            // ===== Col 2: FX → Filter → Master → Sends =====
+            cols[2].label(egui::RichText::new("FX").strong());
+            slider(&mut cols[2], "drive", p.drive, 0.0..=1.0, false, mp.drive, |v| {
+                edit = Some(FieldEdit::Drive(v));
             });
-            slider(&mut cols[2], "length ms", p.click_ms, 0.1..=20.0, true, mp.click_ms, |v| {
-                edit = Some(FieldEdit::ClickMs(v));
+            slider(&mut cols[2], "fold", p.fold, 0.0..=1.0, false, mp.fold, |v| {
+                edit = Some(FieldEdit::Fold(v));
             });
-            cols[2].add_space(12.0);
-            cols[2].label(egui::RichText::new("Master").strong());
-            slider(&mut cols[2], "gain", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
-                edit = Some(FieldEdit::MasterGain(v));
+            slider(&mut cols[2], "crush", p.crush, 0.0..=1.0, false, mp.crush, |v| {
+                edit = Some(FieldEdit::Crush(v));
+            });
+            slider(&mut cols[2], "srr", p.srr, 0.0..=1.0, false, mp.srr, |v| {
+                edit = Some(FieldEdit::Srr(v));
             });
             cols[2].add_space(12.0);
             cols[2].label(egui::RichText::new("Filter").strong());
             cols[2].horizontal(|ui| {
                 ui.label("mode");
                 let mut mode = p.post_filter_mode;
-                for (mm, label) in [
+                for (mm, lbl) in [
                     (FilterMode::Off, "off"),
                     (FilterMode::LowPass, "lp"),
                     (FilterMode::HighPass, "hp"),
                     (FilterMode::BandPass, "bp"),
                 ] {
-                    if ui.selectable_value(&mut mode, mm, label).clicked() {
+                    if ui.selectable_value(&mut mode, mm, lbl).clicked() {
                         edit = Some(FieldEdit::PostFilterMode(mm));
                     }
                 }
@@ -729,6 +898,22 @@ impl App {
             });
             slider(&mut cols[2], "resonance", p.post_filter_q, 0.5..=15.0, true, mp.post_filter_q, |v| {
                 edit = Some(FieldEdit::PostFilterQ(v));
+            });
+            cols[2].add_space(12.0);
+            cols[2].label(egui::RichText::new("Master").strong());
+            slider(&mut cols[2], "gain", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
+                edit = Some(FieldEdit::MasterGain(v));
+            });
+            cols[2].add_space(12.0);
+            cols[2].label(egui::RichText::new("Sends").strong());
+            slider(&mut cols[2], "delay", p.send_delay, 0.0..=1.0, false, mp.send_delay, |v| {
+                edit = Some(FieldEdit::SendDelay(v));
+            });
+            slider(&mut cols[2], "reverb", p.send_reverb, 0.0..=1.0, false, mp.send_reverb, |v| {
+                edit = Some(FieldEdit::SendReverb(v));
+            });
+            slider(&mut cols[2], "dist", p.send_distortion, 0.0..=1.0, false, mp.send_distortion, |v| {
+                edit = Some(FieldEdit::SendDistortion(v));
             });
         });
 
@@ -808,8 +993,20 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            ui.add_space(8.0);
-            self.draw_param_editor(ui);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(egui::RichText::new("Global FX").strong())
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            self.draw_global_fx(ui);
+                        });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    self.draw_param_editor(ui);
+                });
         });
     }
 }

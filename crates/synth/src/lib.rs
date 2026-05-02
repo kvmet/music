@@ -300,25 +300,108 @@ impl Biquad {
     }
 }
 
+// --- Waveforms / noise colors -----------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wave {
+    Sine,
+    Triangle,
+    Saw,
+    Square,
+}
+
+fn wave_sample(wave: Wave, phase: f32) -> f32 {
+    // `phase` is 0..1.
+    match wave {
+        Wave::Sine => (phase * TAU).sin(),
+        Wave::Triangle => 4.0 * (phase - 0.5).abs() - 1.0,
+        Wave::Saw => 2.0 * phase - 1.0,
+        Wave::Square => {
+            if phase < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoiseColor {
+    White,
+    Pink,
+    /// Sample-and-hold noise at a fixed slow rate. Adds a "grainy" crackle.
+    Grain,
+}
+
+/// Paul Kellet's IIR pink-noise filter state.
+#[derive(Default)]
+struct PinkState {
+    b: [f32; 7],
+}
+
+impl PinkState {
+    fn next(&mut self, white: f32) -> f32 {
+        self.b[0] = 0.99886 * self.b[0] + white * 0.0555179;
+        self.b[1] = 0.99332 * self.b[1] + white * 0.0750759;
+        self.b[2] = 0.96900 * self.b[2] + white * 0.1538520;
+        self.b[3] = 0.86650 * self.b[3] + white * 0.3104856;
+        self.b[4] = 0.55000 * self.b[4] + white * 0.5329522;
+        self.b[5] = -0.7616 * self.b[5] - white * 0.0168980;
+        let out = self.b[0] + self.b[1] + self.b[2] + self.b[3] + self.b[4]
+            + self.b[5] + self.b[6] + white * 0.5362;
+        self.b[6] = white * 0.115926;
+        // Compensate level — Kellet's output sits around ±2.
+        out * 0.11
+    }
+}
+
+#[derive(Default)]
+struct GrainState {
+    held: f32,
+    counter: u32,
+}
+
+impl GrainState {
+    fn next(&mut self, white: f32, sample_rate: u32) -> f32 {
+        // ~500Hz S&H rate independent of sample rate.
+        let interval = (sample_rate / 500).max(1);
+        if self.counter == 0 {
+            self.held = white;
+        }
+        self.counter = (self.counter + 1) % interval;
+        self.held
+    }
+}
+
 // --- Drum voice --------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
 pub struct DrumVoiceParams {
-    pub tone_level: f32,
-    pub tone_start_hz: f32,
-    pub tone_end_hz: f32,
-    pub tone_pitch_decay_ms: f32,
-    pub tone_amp_attack_ms: f32,
-    pub tone_amp_decay_ms: f32,
+    // Osc 1 (main, with pitch envelope).
+    pub osc1_wave: Wave,
+    pub osc1_level: f32,
+    pub osc1_start_hz: f32,
+    pub osc1_end_hz: f32,
+    pub osc1_pitch_decay_ms: f32,
+    pub osc1_amp_attack_ms: f32,
+    pub osc1_amp_decay_ms: f32,
 
+    // Osc 2 (modulator / secondary). Tracks osc1's current pitch via ratio.
+    pub osc2_wave: Wave,
+    pub osc2_level: f32,
+    pub osc2_ratio: f32, // multiplier of osc1's instantaneous freq
+
+    /// Osc2 → osc1 frequency modulation index (0 = no FM).
+    pub fm_amount: f32,
+
+    // Noise (filtered, with own envelope).
+    pub noise_color: NoiseColor,
     pub noise_level: f32,
     pub noise_filter_hz: f32,
     pub noise_filter_mode: FilterMode,
     pub noise_amp_attack_ms: f32,
     pub noise_amp_decay_ms: f32,
-
-    pub click_level: f32,
-    pub click_ms: f32,
 
     pub drive: f32,
     pub fold: f32,
@@ -329,25 +412,33 @@ pub struct DrumVoiceParams {
     pub post_filter_q: f32,
     pub post_filter_mode: FilterMode,
 
+    pub send_delay: f32,
+    pub send_reverb: f32,
+    pub send_distortion: f32,
+
     pub master_gain: f32,
 }
 
 /// Per-step parameter overrides. None = inherit voice default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepLocks {
-    pub tone_level: Option<f32>,
-    pub tone_start_hz: Option<f32>,
-    pub tone_end_hz: Option<f32>,
-    pub tone_pitch_decay_ms: Option<f32>,
-    pub tone_amp_attack_ms: Option<f32>,
-    pub tone_amp_decay_ms: Option<f32>,
+    pub osc1_wave: Option<Wave>,
+    pub osc1_level: Option<f32>,
+    pub osc1_start_hz: Option<f32>,
+    pub osc1_end_hz: Option<f32>,
+    pub osc1_pitch_decay_ms: Option<f32>,
+    pub osc1_amp_attack_ms: Option<f32>,
+    pub osc1_amp_decay_ms: Option<f32>,
+    pub osc2_wave: Option<Wave>,
+    pub osc2_level: Option<f32>,
+    pub osc2_ratio: Option<f32>,
+    pub fm_amount: Option<f32>,
+    pub noise_color: Option<NoiseColor>,
     pub noise_level: Option<f32>,
     pub noise_filter_hz: Option<f32>,
     pub noise_filter_mode: Option<FilterMode>,
     pub noise_amp_attack_ms: Option<f32>,
     pub noise_amp_decay_ms: Option<f32>,
-    pub click_level: Option<f32>,
-    pub click_ms: Option<f32>,
     pub drive: Option<f32>,
     pub fold: Option<f32>,
     pub crush: Option<f32>,
@@ -355,24 +446,31 @@ pub struct StepLocks {
     pub post_filter_hz: Option<f32>,
     pub post_filter_q: Option<f32>,
     pub post_filter_mode: Option<FilterMode>,
+    pub send_delay: Option<f32>,
+    pub send_reverb: Option<f32>,
+    pub send_distortion: Option<f32>,
     pub master_gain: Option<f32>,
 }
 
 impl StepLocks {
     pub fn is_empty(&self) -> bool {
-        self.tone_level.is_none()
-            && self.tone_start_hz.is_none()
-            && self.tone_end_hz.is_none()
-            && self.tone_pitch_decay_ms.is_none()
-            && self.tone_amp_attack_ms.is_none()
-            && self.tone_amp_decay_ms.is_none()
+        self.osc1_wave.is_none()
+            && self.osc1_level.is_none()
+            && self.osc1_start_hz.is_none()
+            && self.osc1_end_hz.is_none()
+            && self.osc1_pitch_decay_ms.is_none()
+            && self.osc1_amp_attack_ms.is_none()
+            && self.osc1_amp_decay_ms.is_none()
+            && self.osc2_wave.is_none()
+            && self.osc2_level.is_none()
+            && self.osc2_ratio.is_none()
+            && self.fm_amount.is_none()
+            && self.noise_color.is_none()
             && self.noise_level.is_none()
             && self.noise_filter_hz.is_none()
             && self.noise_filter_mode.is_none()
             && self.noise_amp_attack_ms.is_none()
             && self.noise_amp_decay_ms.is_none()
-            && self.click_level.is_none()
-            && self.click_ms.is_none()
             && self.drive.is_none()
             && self.fold.is_none()
             && self.crush.is_none()
@@ -380,24 +478,31 @@ impl StepLocks {
             && self.post_filter_hz.is_none()
             && self.post_filter_q.is_none()
             && self.post_filter_mode.is_none()
+            && self.send_delay.is_none()
+            && self.send_reverb.is_none()
+            && self.send_distortion.is_none()
             && self.master_gain.is_none()
     }
 
     /// Apply any locked fields onto `p`. Unlocked fields leave `p` untouched.
     pub fn merge_into(&self, p: &mut DrumVoiceParams) {
-        if let Some(v) = self.tone_level { p.tone_level = v; }
-        if let Some(v) = self.tone_start_hz { p.tone_start_hz = v; }
-        if let Some(v) = self.tone_end_hz { p.tone_end_hz = v; }
-        if let Some(v) = self.tone_pitch_decay_ms { p.tone_pitch_decay_ms = v; }
-        if let Some(v) = self.tone_amp_attack_ms { p.tone_amp_attack_ms = v; }
-        if let Some(v) = self.tone_amp_decay_ms { p.tone_amp_decay_ms = v; }
+        if let Some(v) = self.osc1_wave { p.osc1_wave = v; }
+        if let Some(v) = self.osc1_level { p.osc1_level = v; }
+        if let Some(v) = self.osc1_start_hz { p.osc1_start_hz = v; }
+        if let Some(v) = self.osc1_end_hz { p.osc1_end_hz = v; }
+        if let Some(v) = self.osc1_pitch_decay_ms { p.osc1_pitch_decay_ms = v; }
+        if let Some(v) = self.osc1_amp_attack_ms { p.osc1_amp_attack_ms = v; }
+        if let Some(v) = self.osc1_amp_decay_ms { p.osc1_amp_decay_ms = v; }
+        if let Some(v) = self.osc2_wave { p.osc2_wave = v; }
+        if let Some(v) = self.osc2_level { p.osc2_level = v; }
+        if let Some(v) = self.osc2_ratio { p.osc2_ratio = v; }
+        if let Some(v) = self.fm_amount { p.fm_amount = v; }
+        if let Some(v) = self.noise_color { p.noise_color = v; }
         if let Some(v) = self.noise_level { p.noise_level = v; }
         if let Some(v) = self.noise_filter_hz { p.noise_filter_hz = v; }
         if let Some(v) = self.noise_filter_mode { p.noise_filter_mode = v; }
         if let Some(v) = self.noise_amp_attack_ms { p.noise_amp_attack_ms = v; }
         if let Some(v) = self.noise_amp_decay_ms { p.noise_amp_decay_ms = v; }
-        if let Some(v) = self.click_level { p.click_level = v; }
-        if let Some(v) = self.click_ms { p.click_ms = v; }
         if let Some(v) = self.drive { p.drive = v; }
         if let Some(v) = self.fold { p.fold = v; }
         if let Some(v) = self.crush { p.crush = v; }
@@ -405,6 +510,9 @@ impl StepLocks {
         if let Some(v) = self.post_filter_hz { p.post_filter_hz = v; }
         if let Some(v) = self.post_filter_q { p.post_filter_q = v; }
         if let Some(v) = self.post_filter_mode { p.post_filter_mode = v; }
+        if let Some(v) = self.send_delay { p.send_delay = v; }
+        if let Some(v) = self.send_reverb { p.send_reverb = v; }
+        if let Some(v) = self.send_distortion { p.send_distortion = v; }
         if let Some(v) = self.master_gain { p.master_gain = v; }
     }
 }
@@ -412,19 +520,23 @@ impl StepLocks {
 impl Default for DrumVoiceParams {
     fn default() -> Self {
         Self {
-            tone_level: 0.0,
-            tone_start_hz: 100.0,
-            tone_end_hz: 100.0,
-            tone_pitch_decay_ms: 50.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 100.0,
+            osc1_wave: Wave::Sine,
+            osc1_level: 0.0,
+            osc1_start_hz: 100.0,
+            osc1_end_hz: 100.0,
+            osc1_pitch_decay_ms: 50.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 100.0,
+            osc2_wave: Wave::Sine,
+            osc2_level: 0.0,
+            osc2_ratio: 1.0,
+            fm_amount: 0.0,
+            noise_color: NoiseColor::White,
             noise_level: 0.0,
             noise_filter_hz: 1000.0,
             noise_filter_mode: FilterMode::Off,
             noise_amp_attack_ms: 1.0,
             noise_amp_decay_ms: 100.0,
-            click_level: 0.0,
-            click_ms: 1.0,
             drive: 0.0,
             fold: 0.0,
             crush: 0.0,
@@ -432,6 +544,9 @@ impl Default for DrumVoiceParams {
             post_filter_hz: 1000.0,
             post_filter_q: 0.707,
             post_filter_mode: FilterMode::Off,
+            send_delay: 0.0,
+            send_reverb: 0.0,
+            send_distortion: 0.0,
             master_gain: 1.0,
         }
     }
@@ -442,30 +557,32 @@ pub struct DrumVoice {
     params: DrumVoiceParams,
 
     tone_amp: AdEnv,
-    tone_pitch: DecayEnv,
-    tone_phase: f32,
+    pitch_env: DecayEnv,
+    osc1_phase: f32,
+    osc2_phase: f32,
 
     noise_amp: AdEnv,
     noise_filter: OnePole,
+    pink: PinkState,
+    grain: GrainState,
     crusher: Crusher,
     post_filter: Biquad,
     rng: u32,
-
-    click_remaining: u32,
-    click_total: u32,
 
     velocity: f32,
 }
 
 impl DrumVoice {
     pub fn new(params: DrumVoiceParams, sample_rate: u32) -> Self {
-        let click_total = (params.click_ms / 1000.0 * sample_rate as f32).max(0.0) as u32;
         Self {
-            tone_amp: AdEnv::new(params.tone_amp_attack_ms, params.tone_amp_decay_ms, sample_rate),
-            tone_pitch: DecayEnv::new(params.tone_pitch_decay_ms, sample_rate),
-            tone_phase: 0.0,
+            tone_amp: AdEnv::new(params.osc1_amp_attack_ms, params.osc1_amp_decay_ms, sample_rate),
+            pitch_env: DecayEnv::new(params.osc1_pitch_decay_ms, sample_rate),
+            osc1_phase: 0.0,
+            osc2_phase: 0.0,
             noise_amp: AdEnv::new(params.noise_amp_attack_ms, params.noise_amp_decay_ms, sample_rate),
             noise_filter: OnePole::new(params.noise_filter_hz, params.noise_filter_mode, sample_rate),
+            pink: PinkState::default(),
+            grain: GrainState::default(),
             crusher: Crusher::new(),
             post_filter: Biquad::new(
                 params.post_filter_hz,
@@ -474,15 +591,13 @@ impl DrumVoice {
                 sample_rate,
             ),
             rng: 0xCAFEBABE,
-            click_remaining: 0,
-            click_total,
             velocity: 0.0,
             sample_rate,
             params,
         }
     }
 
-    fn next_noise(&mut self) -> f32 {
+    fn next_white(&mut self) -> f32 {
         // xorshift32 -> [-1, 1)
         let mut x = self.rng;
         x ^= x << 13;
@@ -492,23 +607,30 @@ impl DrumVoice {
         (x as i32 as f32) / (i32::MAX as f32)
     }
 
+    fn next_noise(&mut self) -> f32 {
+        let white = self.next_white();
+        match self.params.noise_color {
+            NoiseColor::White => white,
+            NoiseColor::Pink => self.pink.next(white),
+            NoiseColor::Grain => self.grain.next(white, self.sample_rate),
+        }
+    }
+
     pub fn params(&self) -> &DrumVoiceParams {
         &self.params
     }
 
-    /// Replace params and re-derive precomputed values (env increments,
-    /// filter coefficient, click length). Does NOT retrigger.
+    /// Replace params and re-derive precomputed values. Does NOT retrigger.
     pub fn apply_params(&mut self, p: DrumVoiceParams) {
         self.params = p;
         let sr = self.sample_rate;
-        self.tone_amp.set_rates(p.tone_amp_attack_ms, p.tone_amp_decay_ms, sr);
-        self.tone_pitch.set_rate(p.tone_pitch_decay_ms, sr);
+        self.tone_amp.set_rates(p.osc1_amp_attack_ms, p.osc1_amp_decay_ms, sr);
+        self.pitch_env.set_rate(p.osc1_pitch_decay_ms, sr);
         self.noise_amp.set_rates(p.noise_amp_attack_ms, p.noise_amp_decay_ms, sr);
         self.noise_filter.set_cutoff(p.noise_filter_hz, sr);
         self.noise_filter.set_mode(p.noise_filter_mode);
         self.post_filter
             .set(p.post_filter_hz, p.post_filter_q, p.post_filter_mode, sr);
-        self.click_total = (p.click_ms / 1000.0 * sr as f32).max(0.0) as u32;
     }
 }
 
@@ -516,10 +638,10 @@ impl Voice for DrumVoice {
     fn trigger(&mut self, velocity: f32) {
         self.velocity = velocity.clamp(0.0, 1.0);
         self.tone_amp.trigger();
-        self.tone_pitch.trigger();
-        self.tone_phase = 0.0;
+        self.pitch_env.trigger();
+        self.osc1_phase = 0.0;
+        self.osc2_phase = 0.0;
         self.noise_amp.trigger();
-        self.click_remaining = self.click_total;
     }
 
     fn render_add(&mut self, out: &mut [f32]) {
@@ -528,17 +650,33 @@ impl Voice for DrumVoice {
         for s in out.iter_mut() {
             let mut sample = 0.0;
 
-            // Tone layer
-            if p.tone_level > 0.0 && self.tone_amp.is_active() {
-                let pitch_env = self.tone_pitch.next();
-                let freq = p.tone_end_hz + (p.tone_start_hz - p.tone_end_hz) * pitch_env;
-                self.tone_phase += freq / sr;
-                if self.tone_phase >= 1.0 {
-                    self.tone_phase -= 1.0;
+            // Tone block: osc2 modulates osc1's frequency (FM); both summed.
+            let tone_active =
+                self.tone_amp.is_active() && (p.osc1_level > 0.0 || p.osc2_level > 0.0);
+            if tone_active {
+                let pitch = self.pitch_env.next();
+                let base_freq = p.osc1_end_hz + (p.osc1_start_hz - p.osc1_end_hz) * pitch;
+
+                // Osc2 first — its current sample becomes osc1's FM input.
+                let f2 = (base_freq * p.osc2_ratio).max(0.0);
+                self.osc2_phase += f2 / sr;
+                if self.osc2_phase >= 1.0 {
+                    self.osc2_phase -= self.osc2_phase.floor();
                 }
-                let osc = (self.tone_phase * TAU).sin();
+                let osc2 = wave_sample(p.osc2_wave, self.osc2_phase);
+
+                // Osc1 with FM from osc2.
+                let fm = osc2 * p.fm_amount * base_freq;
+                let f1 = (base_freq + fm).max(0.0);
+                self.osc1_phase += f1 / sr;
+                if self.osc1_phase >= 1.0 {
+                    self.osc1_phase -= self.osc1_phase.floor();
+                }
+                let osc1 = wave_sample(p.osc1_wave, self.osc1_phase);
+
                 let amp = self.tone_amp.next();
-                sample += osc * amp * p.tone_level;
+                sample += osc1 * amp * p.osc1_level;
+                sample += osc2 * amp * p.osc2_level;
             }
 
             // Noise layer
@@ -547,14 +685,6 @@ impl Voice for DrumVoice {
                 let filtered = self.noise_filter.process(n);
                 let amp = self.noise_amp.next();
                 sample += filtered * amp * p.noise_level;
-            }
-
-            // Click layer
-            if self.click_remaining > 0 {
-                let n = self.next_noise();
-                let click_amp = self.click_remaining as f32 / self.click_total.max(1) as f32;
-                sample += n * click_amp * p.click_level;
-                self.click_remaining -= 1;
             }
 
             // Insert chain: drive → fold → crush+srr → post-filter.
@@ -568,19 +698,321 @@ impl Voice for DrumVoice {
     }
 }
 
+// --- Global FX ---------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub struct DelayParams {
+    pub time_ms: f32,
+    pub feedback: f32, // 0..0.95
+    pub lpf_hz: f32,   // one-pole on the feedback path
+}
+
+impl Default for DelayParams {
+    fn default() -> Self {
+        Self {
+            time_ms: 300.0,
+            feedback: 0.4,
+            lpf_hz: 4000.0,
+        }
+    }
+}
+
+/// Mono delay with one-pole low-pass on the feedback path.
+pub struct Delay {
+    buf: Vec<f32>,
+    write_idx: usize,
+    sample_rate: u32,
+    fb_z: f32,
+}
+
+impl Delay {
+    pub fn new(sample_rate: u32, max_time_ms: f32) -> Self {
+        let len = ((max_time_ms / 1000.0) * sample_rate as f32).ceil() as usize + 1;
+        Self {
+            buf: vec![0.0; len.max(2)],
+            write_idx: 0,
+            sample_rate,
+            fb_z: 0.0,
+        }
+    }
+
+    /// In-place: `io` enters as the send signal, exits as the wet (delayed) signal.
+    pub fn process(&mut self, io: &mut [f32], params: DelayParams) {
+        let sr = self.sample_rate as f32;
+        let buf_len = self.buf.len();
+        let delay_samples = ((params.time_ms.max(1.0) / 1000.0) * sr) as usize;
+        let delay_samples = delay_samples.clamp(1, buf_len - 1);
+        let fb = params.feedback.clamp(0.0, 0.95);
+        let lpf_a =
+            (1.0 - (-TAU * params.lpf_hz.clamp(20.0, sr * 0.49) / sr).exp()).clamp(0.0, 1.0);
+
+        for s in io.iter_mut() {
+            let read_idx = (self.write_idx + buf_len - delay_samples) % buf_len;
+            let delayed = self.buf[read_idx];
+            // LPF the feedback path so repeats darken naturally.
+            self.fb_z += lpf_a * (delayed - self.fb_z);
+            self.buf[self.write_idx] = *s + self.fb_z * fb;
+            self.write_idx = (self.write_idx + 1) % buf_len;
+            *s = delayed;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BusDistortionParams {
+    pub stage1_drive: f32, // 0..1
+    pub stage1_tone: f32,  // 0=dark, 1=bright (post-clip LPF)
+    pub stage2_drive: f32,
+    pub stage2_tone: f32,
+    /// Pre-clip DC offset on stage 2 — shifts asymmetric clip thresholds and
+    /// creates octave-up character at high amounts. 0 = bypass.
+    pub bias: f32,
+    /// Cross-stage feedback (stage 2 output → stage 1 input, one-sample delayed).
+    /// Creates squelchy, oscillating "dying battery" character. 0 = bypass.
+    pub feedback: f32,
+    /// Hard noise gate at the end of the chain. Higher values = higher threshold,
+    /// making the gate close between waveform cycles for sputter / Velcro fuzz
+    /// character. 0 = bypass.
+    pub gate: f32,
+    pub output: f32, // 0..2
+}
+
+impl Default for BusDistortionParams {
+    fn default() -> Self {
+        Self {
+            stage1_drive: 0.0,
+            stage1_tone: 0.5,
+            stage2_drive: 0.0,
+            stage2_tone: 0.5,
+            bias: 0.0,
+            feedback: 0.0,
+            gate: 0.0,
+            output: 1.0,
+        }
+    }
+}
+
+/// King-of-Tone-inspired bus distortion. Two cascaded stages, each with a
+/// pre-clip HPF (so bass passes clean), a clipping curve, and a post-clip
+/// tone-shape LPF.
+///
+/// Stage 1: tanh soft clip (transparent OD).
+/// Stage 2: asymmetric soft saturation with higher gain (harsher distortion).
+pub struct BusDistortion {
+    stage1_pre: Biquad,
+    stage1_post: Biquad,
+    stage2_pre: Biquad,
+    stage2_post: Biquad,
+    fb_state: f32,
+    gate_env: f32,
+    gate_smooth: f32,
+    sample_rate: u32,
+}
+
+impl BusDistortion {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            stage1_pre: Biquad::new(80.0, 0.707, FilterMode::HighPass, sample_rate),
+            stage1_post: Biquad::new(2500.0, 0.707, FilterMode::LowPass, sample_rate),
+            stage2_pre: Biquad::new(120.0, 0.707, FilterMode::HighPass, sample_rate),
+            stage2_post: Biquad::new(2000.0, 0.707, FilterMode::LowPass, sample_rate),
+            fb_state: 0.0,
+            gate_env: 0.0,
+            gate_smooth: 0.0,
+            sample_rate,
+        }
+    }
+
+    pub fn process(&mut self, io: &mut [f32], params: BusDistortionParams) {
+        let tone_to_hz = |t: f32| {
+            let t = t.clamp(0.0, 1.0);
+            // 200Hz (dark) → 14kHz (bright), log-mapped — wider range so the
+            // top end can really scream when stage 2 is opened up.
+            200.0 * (14000.0_f32 / 200.0).powf(t)
+        };
+        self.stage1_post.set(
+            tone_to_hz(params.stage1_tone),
+            0.707,
+            FilterMode::LowPass,
+            self.sample_rate,
+        );
+        self.stage2_post.set(
+            tone_to_hz(params.stage2_tone),
+            0.707,
+            FilterMode::LowPass,
+            self.sample_rate,
+        );
+
+        // Stage 1 saturates harder (was 1..31). Still tanh, transparent OD character.
+        let g1 = 1.0 + params.stage1_drive.clamp(0.0, 1.0) * 80.0;
+        // Stage 2 is now an asymmetric hard-clip after a tanh pre-saturator.
+        // At max drive it produces a near-square wave with shifted clip points,
+        // so the harmonic content explodes (odd + even).
+        let g2 = 1.0 + params.stage2_drive.clamp(0.0, 1.0) * 150.0;
+        let bias = params.bias.clamp(0.0, 1.0) * 0.5;
+        let fb_amount = params.feedback.clamp(0.0, 0.95);
+        let gate_amt = params.gate.clamp(0.0, 1.0);
+        let gate_threshold = gate_amt * 0.4;
+        let out_gain = params.output.clamp(0.0, 2.0);
+
+        for s in io.iter_mut() {
+            // Cross-stage feedback: last sample of fully-processed signal mixes
+            // back into the input one sample late. Soft-limited via tanh on store.
+            let mut x = *s + self.fb_state * fb_amount;
+
+            // Stage 1: HPF → tanh → tone LPF.
+            x = self.stage1_pre.process(x);
+            x = (x * g1).tanh();
+            x = self.stage1_post.process(x);
+
+            // Stage 2: HPF → bias → tanh → asymmetric hard clip → tone LPF.
+            x = self.stage2_pre.process(x);
+            let pre = ((x + bias) * g2).tanh();
+            x = pre.clamp(-0.55, 0.85);
+            x = self.stage2_post.process(x);
+
+            // Save tanh-bounded value as next sample's feedback source.
+            self.fb_state = (x * 0.95).tanh();
+
+            // Optional sputter gate. Fast attack tracks the envelope; slower
+            // release lets the gate close between cycles when threshold is high.
+            if gate_amt > 0.001 {
+                let abs_x = x.abs();
+                if abs_x > self.gate_env {
+                    self.gate_env = abs_x;
+                } else {
+                    self.gate_env *= 0.995;
+                }
+                let target = if self.gate_env > gate_threshold { 1.0 } else { 0.0 };
+                // Smooth a little to soften the worst clicks without losing sputter.
+                self.gate_smooth += 0.3 * (target - self.gate_smooth);
+                x *= self.gate_smooth;
+            }
+
+            *s = x * out_gain;
+        }
+    }
+}
+
+// --- Reverb ------------------------------------------------------------------
+
+/// Freeverb-style mono reverb: 8 parallel comb filters with damping LPFs in
+/// feedback, followed by 4 allpass filters in series for diffusion.
+const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
+
+struct Comb {
+    buf: Vec<f32>,
+    idx: usize,
+    z: f32,
+}
+
+impl Comb {
+    fn new(len: usize) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            idx: 0,
+            z: 0.0,
+        }
+    }
+    fn process(&mut self, x: f32, fb: f32, damp: f32) -> f32 {
+        let out = self.buf[self.idx];
+        self.z = out * (1.0 - damp) + self.z * damp;
+        self.buf[self.idx] = x + self.z * fb;
+        self.idx = (self.idx + 1) % self.buf.len();
+        out
+    }
+}
+
+struct Allpass {
+    buf: Vec<f32>,
+    idx: usize,
+}
+
+impl Allpass {
+    fn new(len: usize) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            idx: 0,
+        }
+    }
+    fn process(&mut self, x: f32, fb: f32) -> f32 {
+        let buffered = self.buf[self.idx];
+        let out = buffered - x;
+        self.buf[self.idx] = x + buffered * fb;
+        self.idx = (self.idx + 1) % self.buf.len();
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReverbParams {
+    pub size: f32,   // 0..1, longer tail
+    pub damp: f32,   // 0..1, more high-freq damping
+    pub output: f32, // 0..2
+}
+
+impl Default for ReverbParams {
+    fn default() -> Self {
+        Self {
+            size: 0.6,
+            damp: 0.4,
+            output: 1.0,
+        }
+    }
+}
+
+pub struct Reverb {
+    combs: Vec<Comb>,
+    allpasses: Vec<Allpass>,
+}
+
+impl Reverb {
+    pub fn new(sample_rate: u32) -> Self {
+        let scale = sample_rate as f32 / 44100.0;
+        let combs = COMB_TUNINGS
+            .iter()
+            .map(|&t| Comb::new(((t as f32) * scale) as usize))
+            .collect();
+        let allpasses = ALLPASS_TUNINGS
+            .iter()
+            .map(|&t| Allpass::new(((t as f32) * scale) as usize))
+            .collect();
+        Self { combs, allpasses }
+    }
+
+    pub fn process(&mut self, io: &mut [f32], params: ReverbParams) {
+        let fb = 0.70 + params.size.clamp(0.0, 1.0) * 0.28;
+        let damp = params.damp.clamp(0.0, 1.0) * 0.5;
+        let allpass_fb = 0.5;
+        let out_gain = params.output.clamp(0.0, 2.0);
+
+        for s in io.iter_mut() {
+            let input = *s;
+            let mut wet = 0.0;
+            for comb in &mut self.combs {
+                wet += comb.process(input, fb, damp);
+            }
+            for ap in &mut self.allpasses {
+                wet = ap.process(wet, allpass_fb);
+            }
+            // Normalize: 8 combs in parallel, scale down.
+            *s = wet * 0.125 * out_gain;
+        }
+    }
+}
+
 // --- Presets -----------------------------------------------------------------
 
 impl DrumVoiceParams {
     pub fn kick() -> Self {
         Self {
-            tone_level: 1.0,
-            tone_start_hz: 130.0,
-            tone_end_hz: 50.0,
-            tone_pitch_decay_ms: 60.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 250.0,
-            click_level: 0.5,
-            click_ms: 1.5,
+            osc1_level: 1.0,
+            osc1_start_hz: 130.0,
+            osc1_end_hz: 50.0,
+            osc1_pitch_decay_ms: 60.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 250.0,
             master_gain: 0.8,
             ..Default::default()
         }
@@ -588,19 +1020,17 @@ impl DrumVoiceParams {
 
     pub fn snare() -> Self {
         Self {
-            tone_level: 0.55,
-            tone_start_hz: 240.0,
-            tone_end_hz: 180.0,
-            tone_pitch_decay_ms: 25.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 90.0,
+            osc1_level: 0.55,
+            osc1_start_hz: 240.0,
+            osc1_end_hz: 180.0,
+            osc1_pitch_decay_ms: 25.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 90.0,
             noise_level: 0.7,
             noise_filter_hz: 1500.0,
             noise_filter_mode: FilterMode::HighPass,
             noise_amp_attack_ms: 1.0,
             noise_amp_decay_ms: 150.0,
-            click_level: 0.3,
-            click_ms: 1.0,
             master_gain: 0.7,
             ..Default::default()
         }
@@ -632,14 +1062,12 @@ impl DrumVoiceParams {
 
     pub fn tom_lo() -> Self {
         Self {
-            tone_level: 1.0,
-            tone_start_hz: 140.0,
-            tone_end_hz: 90.0,
-            tone_pitch_decay_ms: 50.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 350.0,
-            click_level: 0.2,
-            click_ms: 1.0,
+            osc1_level: 1.0,
+            osc1_start_hz: 140.0,
+            osc1_end_hz: 90.0,
+            osc1_pitch_decay_ms: 50.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 350.0,
             master_gain: 0.7,
             ..Default::default()
         }
@@ -647,14 +1075,12 @@ impl DrumVoiceParams {
 
     pub fn tom_hi() -> Self {
         Self {
-            tone_level: 1.0,
-            tone_start_hz: 230.0,
-            tone_end_hz: 160.0,
-            tone_pitch_decay_ms: 40.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 250.0,
-            click_level: 0.2,
-            click_ms: 1.0,
+            osc1_level: 1.0,
+            osc1_start_hz: 230.0,
+            osc1_end_hz: 160.0,
+            osc1_pitch_decay_ms: 40.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 250.0,
             master_gain: 0.7,
             ..Default::default()
         }
@@ -674,14 +1100,12 @@ impl DrumVoiceParams {
 
     pub fn rim() -> Self {
         Self {
-            tone_level: 0.7,
-            tone_start_hz: 1200.0,
-            tone_end_hz: 800.0,
-            tone_pitch_decay_ms: 8.0,
-            tone_amp_attack_ms: 0.5,
-            tone_amp_decay_ms: 25.0,
-            click_level: 0.5,
-            click_ms: 0.6,
+            osc1_level: 0.7,
+            osc1_start_hz: 1200.0,
+            osc1_end_hz: 800.0,
+            osc1_pitch_decay_ms: 8.0,
+            osc1_amp_attack_ms: 0.5,
+            osc1_amp_decay_ms: 25.0,
             master_gain: 0.6,
             ..Default::default()
         }
@@ -689,12 +1113,12 @@ impl DrumVoiceParams {
 
     pub fn perc_lo() -> Self {
         Self {
-            tone_level: 0.9,
-            tone_start_hz: 400.0,
-            tone_end_hz: 300.0,
-            tone_pitch_decay_ms: 20.0,
-            tone_amp_attack_ms: 1.0,
-            tone_amp_decay_ms: 80.0,
+            osc1_level: 0.9,
+            osc1_start_hz: 400.0,
+            osc1_end_hz: 300.0,
+            osc1_pitch_decay_ms: 20.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 80.0,
             noise_level: 0.2,
             noise_filter_hz: 3000.0,
             noise_filter_mode: FilterMode::HighPass,
@@ -707,12 +1131,12 @@ impl DrumVoiceParams {
 
     pub fn perc_hi() -> Self {
         Self {
-            tone_level: 0.9,
-            tone_start_hz: 900.0,
-            tone_end_hz: 700.0,
-            tone_pitch_decay_ms: 12.0,
-            tone_amp_attack_ms: 0.5,
-            tone_amp_decay_ms: 50.0,
+            osc1_level: 0.9,
+            osc1_start_hz: 900.0,
+            osc1_end_hz: 700.0,
+            osc1_pitch_decay_ms: 12.0,
+            osc1_amp_attack_ms: 0.5,
+            osc1_amp_decay_ms: 50.0,
             noise_level: 0.15,
             noise_filter_hz: 5000.0,
             noise_filter_mode: FilterMode::HighPass,

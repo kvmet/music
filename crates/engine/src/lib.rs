@@ -1,7 +1,10 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use synth::{DrumVoice, DrumVoiceParams, StepLocks, Voice};
+use synth::{
+    BusDistortion, BusDistortionParams, Delay, DelayParams, DrumVoice, DrumVoiceParams,
+    Reverb, ReverbParams, StepLocks, Voice,
+};
 use transport::{PlaybackState, Position, Transport, TransportConfig};
 
 pub use crossbeam_channel::TrySendError;
@@ -28,6 +31,9 @@ pub enum Command {
     ApplyVoiceParams { voice: usize, params: DrumVoiceParams },
     SetStepLocks { voice: usize, step: usize, locks: StepLocks },
     ClearStepLocks { voice: usize, step: usize },
+    SetDelayParams(DelayParams),
+    SetBusDistortionParams(BusDistortionParams),
+    SetReverbParams(ReverbParams),
     Play,
     Stop,
     StopAndRewind,
@@ -53,6 +59,18 @@ pub struct Engine {
     pattern: [[Step; STEPS]; VOICES],
     voices: Vec<DrumVoice>,
     voice_defaults: [DrumVoiceParams; VOICES],
+    // Mix routing scratch. Reused per buffer; grown lazily.
+    voice_buf: Vec<f32>,
+    mix_bus: Vec<f32>,
+    delay_bus: Vec<f32>,
+    reverb_bus: Vec<f32>,
+    distortion_bus: Vec<f32>,
+    delay: Delay,
+    delay_params: DelayParams,
+    bus_distortion: BusDistortion,
+    bus_distortion_params: BusDistortionParams,
+    reverb: Reverb,
+    reverb_params: ReverbParams,
     rx: Receiver<Command>,
     shared: Arc<Shared>,
 }
@@ -77,6 +95,17 @@ impl Engine {
             pattern: [[Step::default(); STEPS]; VOICES],
             voices,
             voice_defaults,
+            voice_buf: Vec::new(),
+            mix_bus: Vec::new(),
+            delay_bus: Vec::new(),
+            reverb_bus: Vec::new(),
+            distortion_bus: Vec::new(),
+            delay: Delay::new(sample_rate, 2000.0),
+            delay_params: DelayParams::default(),
+            bus_distortion: BusDistortion::new(sample_rate),
+            bus_distortion_params: BusDistortionParams::default(),
+            reverb: Reverb::new(sample_rate),
+            reverb_params: ReverbParams::default(),
             rx,
             shared: shared.clone(),
         };
@@ -89,11 +118,17 @@ impl Engine {
             self.apply(cmd);
         }
 
-        for s in out.iter_mut() {
-            *s = 0.0;
-        }
+        let total = out.len();
+        self.ensure_bufs(total);
+
+        // Zero buses for this buffer.
+        for s in &mut self.mix_bus[..total] { *s = 0.0; }
+        for s in &mut self.delay_bus[..total] { *s = 0.0; }
+        for s in &mut self.reverb_bus[..total] { *s = 0.0; }
+        for s in &mut self.distortion_bus[..total] { *s = 0.0; }
 
         if self.transport.state() != PlaybackState::Playing {
+            for s in out.iter_mut() { *s = 0.0; }
             self.publish();
             return;
         }
@@ -101,7 +136,6 @@ impl Engine {
         let cfg = *self.transport.config();
         let start_sample = self.transport.sample_position();
         let start_tick = self.transport.position().ticks;
-        let total = out.len();
 
         // If we're sitting exactly on a step boundary, fire it before rendering.
         if start_tick % TICKS_PER_STEP == 0 {
@@ -119,10 +153,7 @@ impl Engine {
             let render_to = next_step_offset.min(total);
 
             if render_to > written {
-                let seg = &mut out[written..render_to];
-                for v in self.voices.iter_mut() {
-                    v.render_add(seg);
-                }
+                self.render_segment(written, render_to - written);
                 written = render_to;
             }
 
@@ -134,8 +165,53 @@ impl Engine {
             }
         }
 
+        // Run global FX on send buses, then sum into the dry mix.
+        self.delay
+            .process(&mut self.delay_bus[..total], self.delay_params);
+        self.bus_distortion
+            .process(&mut self.distortion_bus[..total], self.bus_distortion_params);
+        self.reverb
+            .process(&mut self.reverb_bus[..total], self.reverb_params);
+        for i in 0..total {
+            out[i] = self.mix_bus[i]
+                + self.delay_bus[i]
+                + self.distortion_bus[i]
+                + self.reverb_bus[i];
+        }
+
         self.transport.advance_samples(total as u64);
         self.publish();
+    }
+
+    fn ensure_bufs(&mut self, len: usize) {
+        if self.voice_buf.len() < len {
+            self.voice_buf.resize(len, 0.0);
+            self.mix_bus.resize(len, 0.0);
+            self.delay_bus.resize(len, 0.0);
+            self.reverb_bus.resize(len, 0.0);
+            self.distortion_bus.resize(len, 0.0);
+        }
+    }
+
+    /// Render one segment (between step boundaries). For each voice, renders
+    /// into a scratch buffer, then sums into the mix bus and (scaled) into
+    /// the send buses.
+    fn render_segment(&mut self, offset: usize, len: usize) {
+        for v_idx in 0..self.voices.len() {
+            let (sd, sr, sx) = {
+                let p = self.voices[v_idx].params();
+                (p.send_delay, p.send_reverb, p.send_distortion)
+            };
+            for s in &mut self.voice_buf[..len] { *s = 0.0; }
+            self.voices[v_idx].render_add(&mut self.voice_buf[..len]);
+            for i in 0..len {
+                let s = self.voice_buf[i];
+                self.mix_bus[offset + i] += s;
+                self.delay_bus[offset + i] += s * sd;
+                self.reverb_bus[offset + i] += s * sr;
+                self.distortion_bus[offset + i] += s * sx;
+            }
+        }
     }
 
     fn fire_step(&mut self, tick: u64) {
@@ -192,6 +268,9 @@ impl Engine {
                     self.pattern[voice][step].locks = StepLocks::default();
                 }
             }
+            Command::SetDelayParams(p) => self.delay_params = p,
+            Command::SetBusDistortionParams(p) => self.bus_distortion_params = p,
+            Command::SetReverbParams(p) => self.reverb_params = p,
             Command::Play => self.transport.play(),
             Command::Stop => self.transport.stop(),
             Command::StopAndRewind => {
