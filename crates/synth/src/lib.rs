@@ -158,6 +158,67 @@ impl OnePole {
     }
 }
 
+/// Soft-clip drive. `amount` is 0..1, with 0 = clean.
+/// Internally maps to a tanh saturation with gain ramping up to 31x at max.
+pub fn drive(x: f32, amount: f32) -> f32 {
+    let a = amount.clamp(0.0, 1.0);
+    if a <= 0.001 {
+        return x;
+    }
+    let gain = 1.0 + a * 30.0;
+    let driven = (x * gain).tanh();
+    x * (1.0 - a) + driven * a
+}
+
+/// Sine wavefolder. `amount` is 0..1, with 0 = clean.
+/// At higher amounts, input is gained into a sine which folds back on itself.
+pub fn fold(x: f32, amount: f32) -> f32 {
+    let a = amount.clamp(0.0, 1.0);
+    if a <= 0.001 {
+        return x;
+    }
+    let gain = 1.0 + a * 5.0;
+    (x * gain).sin()
+}
+
+/// Combined bit-crush + sample-rate reduction. Both inputs are 0..1 amounts.
+/// Stateful so SRR can hold samples across calls.
+pub struct Crusher {
+    held: f32,
+    accum: f32,
+}
+
+impl Crusher {
+    pub fn new() -> Self {
+        Self { held: 0.0, accum: 0.0 }
+    }
+
+    /// `crush`: 0 = clean (16-bit-ish), 1 = harshly quantized.
+    /// `srr`:   0 = full sample rate, 1 = held for ~100 samples.
+    pub fn process(&mut self, x: f32, crush: f32, srr: f32) -> f32 {
+        // SRR: advance the accumulator at a rate that scales with (1 - srr).
+        let step = (1.0 - srr.clamp(0.0, 0.99)).max(1e-3);
+        self.accum += step;
+        if self.accum >= 1.0 {
+            self.accum -= 1.0;
+            self.held = x;
+        }
+        let c = crush.clamp(0.0, 1.0);
+        if c <= 0.001 {
+            return self.held;
+        }
+        let bits = 16.0 - 15.0 * c;
+        let steps = 2.0_f32.powf(bits - 1.0);
+        (self.held * steps).round() / steps
+    }
+}
+
+impl Default for Crusher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resonant biquad (RBJ cookbook). Direct form I.
 pub struct Biquad {
     b0: f32,
@@ -259,6 +320,11 @@ pub struct DrumVoiceParams {
     pub click_level: f32,
     pub click_ms: f32,
 
+    pub drive: f32,
+    pub fold: f32,
+    pub crush: f32,
+    pub srr: f32,
+
     pub post_filter_hz: f32,
     pub post_filter_q: f32,
     pub post_filter_mode: FilterMode,
@@ -282,6 +348,10 @@ pub struct StepLocks {
     pub noise_amp_decay_ms: Option<f32>,
     pub click_level: Option<f32>,
     pub click_ms: Option<f32>,
+    pub drive: Option<f32>,
+    pub fold: Option<f32>,
+    pub crush: Option<f32>,
+    pub srr: Option<f32>,
     pub post_filter_hz: Option<f32>,
     pub post_filter_q: Option<f32>,
     pub post_filter_mode: Option<FilterMode>,
@@ -303,6 +373,10 @@ impl StepLocks {
             && self.noise_amp_decay_ms.is_none()
             && self.click_level.is_none()
             && self.click_ms.is_none()
+            && self.drive.is_none()
+            && self.fold.is_none()
+            && self.crush.is_none()
+            && self.srr.is_none()
             && self.post_filter_hz.is_none()
             && self.post_filter_q.is_none()
             && self.post_filter_mode.is_none()
@@ -324,6 +398,10 @@ impl StepLocks {
         if let Some(v) = self.noise_amp_decay_ms { p.noise_amp_decay_ms = v; }
         if let Some(v) = self.click_level { p.click_level = v; }
         if let Some(v) = self.click_ms { p.click_ms = v; }
+        if let Some(v) = self.drive { p.drive = v; }
+        if let Some(v) = self.fold { p.fold = v; }
+        if let Some(v) = self.crush { p.crush = v; }
+        if let Some(v) = self.srr { p.srr = v; }
         if let Some(v) = self.post_filter_hz { p.post_filter_hz = v; }
         if let Some(v) = self.post_filter_q { p.post_filter_q = v; }
         if let Some(v) = self.post_filter_mode { p.post_filter_mode = v; }
@@ -347,6 +425,10 @@ impl Default for DrumVoiceParams {
             noise_amp_decay_ms: 100.0,
             click_level: 0.0,
             click_ms: 1.0,
+            drive: 0.0,
+            fold: 0.0,
+            crush: 0.0,
+            srr: 0.0,
             post_filter_hz: 1000.0,
             post_filter_q: 0.707,
             post_filter_mode: FilterMode::Off,
@@ -365,6 +447,7 @@ pub struct DrumVoice {
 
     noise_amp: AdEnv,
     noise_filter: OnePole,
+    crusher: Crusher,
     post_filter: Biquad,
     rng: u32,
 
@@ -383,6 +466,7 @@ impl DrumVoice {
             tone_phase: 0.0,
             noise_amp: AdEnv::new(params.noise_amp_attack_ms, params.noise_amp_decay_ms, sample_rate),
             noise_filter: OnePole::new(params.noise_filter_hz, params.noise_filter_mode, sample_rate),
+            crusher: Crusher::new(),
             post_filter: Biquad::new(
                 params.post_filter_hz,
                 params.post_filter_q,
@@ -473,7 +557,10 @@ impl Voice for DrumVoice {
                 self.click_remaining -= 1;
             }
 
-            // Insert chain (currently just post-filter; drive/fold/crush slot in here later).
+            // Insert chain: drive → fold → crush+srr → post-filter.
+            sample = drive(sample, p.drive);
+            sample = fold(sample, p.fold);
+            sample = self.crusher.process(sample, p.crush, p.srr);
             sample = self.post_filter.process(sample);
 
             *s += sample * p.master_gain * self.velocity;

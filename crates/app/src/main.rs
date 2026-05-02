@@ -36,6 +36,10 @@ enum FieldEdit {
     NoiseAmpDecayMs(f32),
     ClickLevel(f32),
     ClickMs(f32),
+    Drive(f32),
+    Fold(f32),
+    Crush(f32),
+    Srr(f32),
     PostFilterHz(f32),
     PostFilterQ(f32),
     PostFilterMode(FilterMode),
@@ -58,6 +62,10 @@ impl FieldEdit {
             FieldEdit::NoiseAmpDecayMs(v) => p.noise_amp_decay_ms = v,
             FieldEdit::ClickLevel(v) => p.click_level = v,
             FieldEdit::ClickMs(v) => p.click_ms = v,
+            FieldEdit::Drive(v) => p.drive = v,
+            FieldEdit::Fold(v) => p.fold = v,
+            FieldEdit::Crush(v) => p.crush = v,
+            FieldEdit::Srr(v) => p.srr = v,
             FieldEdit::PostFilterHz(v) => p.post_filter_hz = v,
             FieldEdit::PostFilterQ(v) => p.post_filter_q = v,
             FieldEdit::PostFilterMode(v) => p.post_filter_mode = v,
@@ -80,6 +88,10 @@ impl FieldEdit {
             FieldEdit::NoiseAmpDecayMs(v) => l.noise_amp_decay_ms = Some(v),
             FieldEdit::ClickLevel(v) => l.click_level = Some(v),
             FieldEdit::ClickMs(v) => l.click_ms = Some(v),
+            FieldEdit::Drive(v) => l.drive = Some(v),
+            FieldEdit::Fold(v) => l.fold = Some(v),
+            FieldEdit::Crush(v) => l.crush = Some(v),
+            FieldEdit::Srr(v) => l.srr = Some(v),
             FieldEdit::PostFilterHz(v) => l.post_filter_hz = Some(v),
             FieldEdit::PostFilterQ(v) => l.post_filter_q = Some(v),
             FieldEdit::PostFilterMode(v) => l.post_filter_mode = Some(v),
@@ -467,6 +479,10 @@ fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
     if src.noise_amp_decay_ms.is_some() { target.noise_amp_decay_ms = src.noise_amp_decay_ms; }
     if src.click_level.is_some() { target.click_level = src.click_level; }
     if src.click_ms.is_some() { target.click_ms = src.click_ms; }
+    if src.drive.is_some() { target.drive = src.drive; }
+    if src.fold.is_some() { target.fold = src.fold; }
+    if src.crush.is_some() { target.crush = src.crush; }
+    if src.srr.is_some() { target.srr = src.srr; }
     if src.post_filter_hz.is_some() { target.post_filter_hz = src.post_filter_hz; }
     if src.post_filter_q.is_some() { target.post_filter_q = src.post_filter_q; }
     if src.post_filter_mode.is_some() { target.post_filter_mode = src.post_filter_mode; }
@@ -635,6 +651,20 @@ impl App {
             });
             slider(&mut cols[0], "decay ms", p.tone_amp_decay_ms, 1.0..=2000.0, true, mp.tone_amp_decay_ms, |v| {
                 edit = Some(FieldEdit::ToneAmpDecayMs(v));
+            });
+            cols[0].add_space(12.0);
+            cols[0].label(egui::RichText::new("FX").strong());
+            slider(&mut cols[0], "drive", p.drive, 0.0..=1.0, false, mp.drive, |v| {
+                edit = Some(FieldEdit::Drive(v));
+            });
+            slider(&mut cols[0], "fold", p.fold, 0.0..=1.0, false, mp.fold, |v| {
+                edit = Some(FieldEdit::Fold(v));
+            });
+            slider(&mut cols[0], "crush", p.crush, 0.0..=1.0, false, mp.crush, |v| {
+                edit = Some(FieldEdit::Crush(v));
+            });
+            slider(&mut cols[0], "srr", p.srr, 0.0..=1.0, false, mp.srr, |v| {
+                edit = Some(FieldEdit::Srr(v));
             });
 
             // Noise
