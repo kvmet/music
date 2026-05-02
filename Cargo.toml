@@ -1,4 +1,9 @@
 [workspace]
-members = ["crates/transport"]
+members = ["crates/app", "crates/engine", "crates/synth","crates/transport"]
 
 resolver="3"
+
+[workspace.dependencies]
+transport = { path = "crates/transport" }
+synth = { path = "crates/synth" }
+engine = { path = "crates/engine" }
