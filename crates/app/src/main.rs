@@ -11,7 +11,7 @@ use synth::{
 
 const VOICE_NAMES: [&str; VOICES] = [
     "kick", "snare", "closed hat", "open hat", "tom lo", "tom hi", "clap", "rim",
-    "perc lo", "perc hi",
+    "perc lo", "bass",
 ];
 
 /// Discrete edit destination for slider changes.
@@ -1104,7 +1104,7 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
         DrumVoiceParams::clap(),
         DrumVoiceParams::rim(),
         DrumVoiceParams::perc_lo(),
-        DrumVoiceParams::perc_hi(),
+        DrumVoiceParams::bass(),
     ];
     let voices: Vec<DrumVoice> = presets
         .iter()

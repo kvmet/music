@@ -822,14 +822,14 @@ pub struct BusDistortionParams {
 impl Default for BusDistortionParams {
     fn default() -> Self {
         Self {
-            stage1_drive: 0.0,
-            stage1_tone: 0.5,
-            stage2_drive: 0.0,
-            stage2_tone: 0.5,
-            bias: 0.0,
+            stage1_drive: 0.14,
+            stage1_tone: 0.36,
+            stage2_drive: 0.30,
+            stage2_tone: 0.65,
+            bias: 0.25,
             feedback: 0.0,
             gate: 0.0,
-            output: 1.0,
+            output: 0.42,
         }
     }
 }
@@ -1046,40 +1046,52 @@ impl Reverb {
 
 impl DrumVoiceParams {
     pub fn kick() -> Self {
+        // Sine kick + sub triangle one octave below for thump. Light drive.
         Self {
+            osc1_wave: Wave::Sine,
             osc1_level: 1.0,
             osc1_start_hz: 130.0,
             osc1_end_hz: 50.0,
-            osc1_pitch_decay_ms: 60.0,
+            osc1_pitch_decay_ms: 55.0,
             osc1_amp_attack_ms: 1.0,
             osc1_amp_decay_ms: 250.0,
+            osc2_wave: Wave::Triangle,
+            osc2_level: 0.25,
+            osc2_ratio: 0.5,
+            drive: 0.15,
             master_gain: 0.8,
             ..Default::default()
         }
     }
 
     pub fn snare() -> Self {
+        // Triangle body (richer than sine) + pink noise for warmth + drive for snap.
         Self {
-            osc1_level: 0.55,
+            osc1_wave: Wave::Triangle,
+            osc1_level: 0.5,
             osc1_start_hz: 240.0,
             osc1_end_hz: 180.0,
             osc1_pitch_decay_ms: 25.0,
             osc1_amp_attack_ms: 1.0,
             osc1_amp_decay_ms: 90.0,
-            noise_level: 0.7,
-            noise_filter_hz: 1500.0,
+            noise_color: NoiseColor::Pink,
+            noise_level: 0.75,
+            noise_filter_hz: 1800.0,
             noise_filter_mode: FilterMode::HighPass,
             noise_amp_attack_ms: 1.0,
             noise_amp_decay_ms: 150.0,
+            drive: 0.2,
             master_gain: 0.7,
             ..Default::default()
         }
     }
 
     pub fn closed_hat() -> Self {
+        // Digital LFSR clocked high for that 8-bit / chip hat character.
         Self {
-            noise_level: 0.9,
-            noise_filter_hz: 7000.0,
+            noise_color: NoiseColor::Digital,
+            noise_level: 0.85,
+            noise_filter_hz: 6500.0,
             noise_filter_mode: FilterMode::HighPass,
             noise_amp_attack_ms: 1.0,
             noise_amp_decay_ms: 35.0,
@@ -1089,101 +1101,140 @@ impl DrumVoiceParams {
     }
 
     pub fn open_hat() -> Self {
+        // Pink noise for an analog-style open hat with a longer tail.
         Self {
+            noise_color: NoiseColor::Pink,
             noise_level: 0.85,
-            noise_filter_hz: 6500.0,
+            noise_filter_hz: 5500.0,
             noise_filter_mode: FilterMode::HighPass,
             noise_amp_attack_ms: 1.0,
-            noise_amp_decay_ms: 280.0,
+            noise_amp_decay_ms: 320.0,
             master_gain: 0.45,
             ..Default::default()
         }
     }
 
     pub fn tom_lo() -> Self {
+        // Subtle FM gives the tom a touch of clang without going full bell.
         Self {
+            osc1_wave: Wave::Sine,
             osc1_level: 1.0,
-            osc1_start_hz: 140.0,
-            osc1_end_hz: 90.0,
-            osc1_pitch_decay_ms: 50.0,
+            osc1_start_hz: 160.0,
+            osc1_end_hz: 95.0,
+            osc1_pitch_decay_ms: 60.0,
             osc1_amp_attack_ms: 1.0,
-            osc1_amp_decay_ms: 350.0,
+            osc1_amp_decay_ms: 380.0,
+            osc2_wave: Wave::Sine,
+            osc2_level: 0.0,
+            osc2_ratio: 1.4,
+            fm_amount: 0.12,
+            drive: 0.08,
             master_gain: 0.7,
             ..Default::default()
         }
     }
 
     pub fn tom_hi() -> Self {
+        // Higher inharmonic ratio for a brighter, more bell-tinged tom.
         Self {
+            osc1_wave: Wave::Sine,
             osc1_level: 1.0,
-            osc1_start_hz: 230.0,
-            osc1_end_hz: 160.0,
-            osc1_pitch_decay_ms: 40.0,
+            osc1_start_hz: 260.0,
+            osc1_end_hz: 165.0,
+            osc1_pitch_decay_ms: 45.0,
             osc1_amp_attack_ms: 1.0,
-            osc1_amp_decay_ms: 250.0,
+            osc1_amp_decay_ms: 270.0,
+            osc2_wave: Wave::Sine,
+            osc2_level: 0.0,
+            osc2_ratio: 2.7,
+            fm_amount: 0.18,
+            drive: 0.08,
             master_gain: 0.7,
             ..Default::default()
         }
     }
 
     pub fn clap() -> Self {
+        // Grain noise gives the clap a granular / handclap-y texture.
         Self {
+            noise_color: NoiseColor::Grain,
             noise_level: 0.95,
-            noise_filter_hz: 1200.0,
+            noise_filter_hz: 1400.0,
             noise_filter_mode: FilterMode::HighPass,
             noise_amp_attack_ms: 2.0,
-            noise_amp_decay_ms: 120.0,
+            noise_amp_decay_ms: 130.0,
+            drive: 0.15,
             master_gain: 0.55,
             ..Default::default()
         }
     }
 
     pub fn rim() -> Self {
+        // Square + drive for a sharp, plastic-y rim click.
         Self {
-            osc1_level: 0.7,
-            osc1_start_hz: 1200.0,
+            osc1_wave: Wave::Square,
+            osc1_level: 0.55,
+            osc1_start_hz: 1400.0,
             osc1_end_hz: 800.0,
-            osc1_pitch_decay_ms: 8.0,
+            osc1_pitch_decay_ms: 6.0,
             osc1_amp_attack_ms: 0.5,
-            osc1_amp_decay_ms: 25.0,
+            osc1_amp_decay_ms: 22.0,
+            drive: 0.3,
             master_gain: 0.6,
             ..Default::default()
         }
     }
 
     pub fn perc_lo() -> Self {
+        // Heavy FM + fold for a metallic, bell-like perc.
         Self {
-            osc1_level: 0.9,
-            osc1_start_hz: 400.0,
-            osc1_end_hz: 300.0,
-            osc1_pitch_decay_ms: 20.0,
+            osc1_wave: Wave::Sine,
+            osc1_level: 0.85,
+            osc1_start_hz: 420.0,
+            osc1_end_hz: 280.0,
+            osc1_pitch_decay_ms: 18.0,
             osc1_amp_attack_ms: 1.0,
-            osc1_amp_decay_ms: 80.0,
-            noise_level: 0.2,
-            noise_filter_hz: 3000.0,
-            noise_filter_mode: FilterMode::HighPass,
-            noise_amp_attack_ms: 1.0,
-            noise_amp_decay_ms: 60.0,
+            osc1_amp_decay_ms: 90.0,
+            osc2_wave: Wave::Triangle,
+            osc2_level: 0.1,
+            osc2_ratio: 3.6,
+            fm_amount: 0.35,
+            fold: 0.12,
             master_gain: 0.6,
             ..Default::default()
         }
     }
 
-    pub fn perc_hi() -> Self {
+    pub fn bass() -> Self {
         Self {
-            osc1_level: 0.9,
-            osc1_start_hz: 900.0,
-            osc1_end_hz: 700.0,
-            osc1_pitch_decay_ms: 12.0,
-            osc1_amp_attack_ms: 0.5,
-            osc1_amp_decay_ms: 50.0,
-            noise_level: 0.15,
-            noise_filter_hz: 5000.0,
-            noise_filter_mode: FilterMode::HighPass,
-            noise_amp_attack_ms: 0.5,
-            noise_amp_decay_ms: 40.0,
-            master_gain: 0.55,
-            ..Default::default()
+            osc1_wave: Wave::Sine,
+            osc1_level: 0.63,
+            osc1_start_hz: 800.0,
+            osc1_end_hz: 100.0,
+            osc1_pitch_decay_ms: 5.0,
+            osc1_amp_attack_ms: 1.0,
+            osc1_amp_decay_ms: 800.0,
+            osc2_wave: Wave::Sine,
+            osc2_level: 0.09,
+            osc2_ratio: 0.5,
+            fm_amount: 0.18,
+            noise_color: NoiseColor::White,
+            noise_level: 0.20,
+            noise_filter_hz: 1000.0,
+            noise_filter_mode: FilterMode::Off,
+            noise_amp_attack_ms: 1.0,
+            noise_amp_decay_ms: 100.0,
+            drive: 0.20,
+            fold: 0.10,
+            crush: 0.0,
+            srr: 0.0,
+            post_filter_hz: 1000.0,
+            post_filter_q: 0.71,
+            post_filter_mode: FilterMode::Off,
+            send_delay: 0.0,
+            send_reverb: 0.0,
+            send_distortion: 0.0,
+            master_gain: 0.70,
         }
     }
 }
