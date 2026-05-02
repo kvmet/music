@@ -116,6 +116,8 @@ pub enum FilterMode {
     Off,
     LowPass,
     HighPass,
+    /// Band-pass. Only meaningful for `Biquad`; `OnePole` treats it as Off.
+    BandPass,
 }
 
 /// One-pole filter. Cheap, gentle 6 dB/oct slope. Good enough for noise shaping.
@@ -143,7 +145,7 @@ impl OnePole {
 
     pub fn process(&mut self, x: f32) -> f32 {
         match self.mode {
-            FilterMode::Off => x,
+            FilterMode::Off | FilterMode::BandPass => x,
             FilterMode::LowPass => {
                 self.z += self.a * (x - self.z);
                 self.z
@@ -153,6 +155,87 @@ impl OnePole {
                 x - self.z
             }
         }
+    }
+}
+
+/// Resonant biquad (RBJ cookbook). Direct form I.
+pub struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+    mode: FilterMode,
+}
+
+impl Biquad {
+    pub fn new(cutoff_hz: f32, q: f32, mode: FilterMode, sample_rate: u32) -> Self {
+        let mut b = Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+            mode,
+        };
+        b.set(cutoff_hz, q, mode, sample_rate);
+        b
+    }
+
+    pub fn set(&mut self, cutoff_hz: f32, q: f32, mode: FilterMode, sample_rate: u32) {
+        self.mode = mode;
+        if matches!(mode, FilterMode::Off) {
+            return;
+        }
+        let sr = sample_rate as f32;
+        let f = cutoff_hz.clamp(20.0, sr * 0.49);
+        let q = q.max(0.5);
+        let omega = TAU * f / sr;
+        let cos_w = omega.cos();
+        let sin_w = omega.sin();
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w;
+        let a2 = 1.0 - alpha;
+        let (b0, b1, b2) = match mode {
+            FilterMode::LowPass => {
+                let k = (1.0 - cos_w) / 2.0;
+                (k, 1.0 - cos_w, k)
+            }
+            FilterMode::HighPass => {
+                let k = (1.0 + cos_w) / 2.0;
+                (k, -(1.0 + cos_w), k)
+            }
+            FilterMode::BandPass => (alpha, 0.0, -alpha),
+            FilterMode::Off => unreachable!(),
+        };
+        self.b0 = b0 / a0;
+        self.b1 = b1 / a0;
+        self.b2 = b2 / a0;
+        self.a1 = a1 / a0;
+        self.a2 = a2 / a0;
+    }
+
+    pub fn process(&mut self, x: f32) -> f32 {
+        if matches!(self.mode, FilterMode::Off) {
+            return x;
+        }
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
     }
 }
 
@@ -176,6 +259,10 @@ pub struct DrumVoiceParams {
     pub click_level: f32,
     pub click_ms: f32,
 
+    pub post_filter_hz: f32,
+    pub post_filter_q: f32,
+    pub post_filter_mode: FilterMode,
+
     pub master_gain: f32,
 }
 
@@ -195,6 +282,9 @@ pub struct StepLocks {
     pub noise_amp_decay_ms: Option<f32>,
     pub click_level: Option<f32>,
     pub click_ms: Option<f32>,
+    pub post_filter_hz: Option<f32>,
+    pub post_filter_q: Option<f32>,
+    pub post_filter_mode: Option<FilterMode>,
     pub master_gain: Option<f32>,
 }
 
@@ -213,6 +303,9 @@ impl StepLocks {
             && self.noise_amp_decay_ms.is_none()
             && self.click_level.is_none()
             && self.click_ms.is_none()
+            && self.post_filter_hz.is_none()
+            && self.post_filter_q.is_none()
+            && self.post_filter_mode.is_none()
             && self.master_gain.is_none()
     }
 
@@ -231,6 +324,9 @@ impl StepLocks {
         if let Some(v) = self.noise_amp_decay_ms { p.noise_amp_decay_ms = v; }
         if let Some(v) = self.click_level { p.click_level = v; }
         if let Some(v) = self.click_ms { p.click_ms = v; }
+        if let Some(v) = self.post_filter_hz { p.post_filter_hz = v; }
+        if let Some(v) = self.post_filter_q { p.post_filter_q = v; }
+        if let Some(v) = self.post_filter_mode { p.post_filter_mode = v; }
         if let Some(v) = self.master_gain { p.master_gain = v; }
     }
 }
@@ -251,6 +347,9 @@ impl Default for DrumVoiceParams {
             noise_amp_decay_ms: 100.0,
             click_level: 0.0,
             click_ms: 1.0,
+            post_filter_hz: 1000.0,
+            post_filter_q: 0.707,
+            post_filter_mode: FilterMode::Off,
             master_gain: 1.0,
         }
     }
@@ -266,6 +365,7 @@ pub struct DrumVoice {
 
     noise_amp: AdEnv,
     noise_filter: OnePole,
+    post_filter: Biquad,
     rng: u32,
 
     click_remaining: u32,
@@ -283,6 +383,12 @@ impl DrumVoice {
             tone_phase: 0.0,
             noise_amp: AdEnv::new(params.noise_amp_attack_ms, params.noise_amp_decay_ms, sample_rate),
             noise_filter: OnePole::new(params.noise_filter_hz, params.noise_filter_mode, sample_rate),
+            post_filter: Biquad::new(
+                params.post_filter_hz,
+                params.post_filter_q,
+                params.post_filter_mode,
+                sample_rate,
+            ),
             rng: 0xCAFEBABE,
             click_remaining: 0,
             click_total,
@@ -316,6 +422,8 @@ impl DrumVoice {
         self.noise_amp.set_rates(p.noise_amp_attack_ms, p.noise_amp_decay_ms, sr);
         self.noise_filter.set_cutoff(p.noise_filter_hz, sr);
         self.noise_filter.set_mode(p.noise_filter_mode);
+        self.post_filter
+            .set(p.post_filter_hz, p.post_filter_q, p.post_filter_mode, sr);
         self.click_total = (p.click_ms / 1000.0 * sr as f32).max(0.0) as u32;
     }
 }
@@ -364,6 +472,9 @@ impl Voice for DrumVoice {
                 sample += n * click_amp * p.click_level;
                 self.click_remaining -= 1;
             }
+
+            // Insert chain (currently just post-filter; drive/fold/crush slot in here later).
+            sample = self.post_filter.process(sample);
 
             *s += sample * p.master_gain * self.velocity;
         }

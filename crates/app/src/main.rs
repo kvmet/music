@@ -36,6 +36,9 @@ enum FieldEdit {
     NoiseAmpDecayMs(f32),
     ClickLevel(f32),
     ClickMs(f32),
+    PostFilterHz(f32),
+    PostFilterQ(f32),
+    PostFilterMode(FilterMode),
     MasterGain(f32),
 }
 
@@ -55,6 +58,9 @@ impl FieldEdit {
             FieldEdit::NoiseAmpDecayMs(v) => p.noise_amp_decay_ms = v,
             FieldEdit::ClickLevel(v) => p.click_level = v,
             FieldEdit::ClickMs(v) => p.click_ms = v,
+            FieldEdit::PostFilterHz(v) => p.post_filter_hz = v,
+            FieldEdit::PostFilterQ(v) => p.post_filter_q = v,
+            FieldEdit::PostFilterMode(v) => p.post_filter_mode = v,
             FieldEdit::MasterGain(v) => p.master_gain = v,
         }
     }
@@ -74,6 +80,9 @@ impl FieldEdit {
             FieldEdit::NoiseAmpDecayMs(v) => l.noise_amp_decay_ms = Some(v),
             FieldEdit::ClickLevel(v) => l.click_level = Some(v),
             FieldEdit::ClickMs(v) => l.click_ms = Some(v),
+            FieldEdit::PostFilterHz(v) => l.post_filter_hz = Some(v),
+            FieldEdit::PostFilterQ(v) => l.post_filter_q = Some(v),
+            FieldEdit::PostFilterMode(v) => l.post_filter_mode = Some(v),
             FieldEdit::MasterGain(v) => l.master_gain = Some(v),
         }
     }
@@ -458,6 +467,9 @@ fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
     if src.noise_amp_decay_ms.is_some() { target.noise_amp_decay_ms = src.noise_amp_decay_ms; }
     if src.click_level.is_some() { target.click_level = src.click_level; }
     if src.click_ms.is_some() { target.click_ms = src.click_ms; }
+    if src.post_filter_hz.is_some() { target.post_filter_hz = src.post_filter_hz; }
+    if src.post_filter_q.is_some() { target.post_filter_q = src.post_filter_q; }
+    if src.post_filter_mode.is_some() { target.post_filter_mode = src.post_filter_mode; }
     if src.master_gain.is_some() { target.master_gain = src.master_gain; }
 }
 
@@ -665,6 +677,28 @@ impl App {
             cols[2].label(egui::RichText::new("Master").strong());
             slider(&mut cols[2], "gain", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
                 edit = Some(FieldEdit::MasterGain(v));
+            });
+            cols[2].add_space(12.0);
+            cols[2].label(egui::RichText::new("Filter").strong());
+            cols[2].horizontal(|ui| {
+                ui.label("mode");
+                let mut mode = p.post_filter_mode;
+                for (mm, label) in [
+                    (FilterMode::Off, "off"),
+                    (FilterMode::LowPass, "lp"),
+                    (FilterMode::HighPass, "hp"),
+                    (FilterMode::BandPass, "bp"),
+                ] {
+                    if ui.selectable_value(&mut mode, mm, label).clicked() {
+                        edit = Some(FieldEdit::PostFilterMode(mm));
+                    }
+                }
+            });
+            slider(&mut cols[2], "cutoff hz", p.post_filter_hz, 20.0..=18000.0, true, mp.post_filter_hz, |v| {
+                edit = Some(FieldEdit::PostFilterHz(v));
+            });
+            slider(&mut cols[2], "resonance", p.post_filter_q, 0.5..=15.0, true, mp.post_filter_q, |v| {
+                edit = Some(FieldEdit::PostFilterQ(v));
             });
         });
 
