@@ -453,6 +453,7 @@ pub struct DrumVoiceParams {
     pub send_distortion: f32,
 
     pub master_gain: f32,
+    pub pan: f32, // -1.0 (L) .. 1.0 (R), equal-power
 }
 
 /// Per-step parameter overrides. None = inherit voice default.
@@ -486,6 +487,7 @@ pub struct StepLocks {
     pub send_reverb: Option<f32>,
     pub send_distortion: Option<f32>,
     pub master_gain: Option<f32>,
+    pub pan: Option<f32>,
 }
 
 impl StepLocks {
@@ -518,6 +520,7 @@ impl StepLocks {
             && self.send_reverb.is_none()
             && self.send_distortion.is_none()
             && self.master_gain.is_none()
+            && self.pan.is_none()
     }
 
     /// Apply any locked fields onto `p`. Unlocked fields leave `p` untouched.
@@ -550,6 +553,7 @@ impl StepLocks {
         if let Some(v) = self.send_reverb { p.send_reverb = v; }
         if let Some(v) = self.send_distortion { p.send_distortion = v; }
         if let Some(v) = self.master_gain { p.master_gain = v; }
+        if let Some(v) = self.pan { p.pan = v; }
     }
 }
 
@@ -584,6 +588,7 @@ impl Default for DrumVoiceParams {
             send_reverb: 0.0,
             send_distortion: 0.0,
             master_gain: 1.0,
+            pan: 0.0,
         }
     }
 }
@@ -735,7 +740,9 @@ impl Voice for DrumVoice {
             sample = self.crusher.process(sample, p.crush, p.srr);
             sample = self.post_filter.process(sample);
 
-            *s += sample * p.master_gain * self.velocity;
+            // master_gain is applied by the engine to the dry mix only, so
+            // sends remain at full level even when "out" is turned down.
+            *s += sample * self.velocity;
         }
     }
 }
@@ -747,6 +754,7 @@ pub struct DelayParams {
     pub time_ms: f32,
     pub feedback: f32, // 0..0.95
     pub lpf_hz: f32,   // one-pole on the feedback path
+    pub ping_pong: f32, // 0 = parallel mono, 1 = full L<->R cross-feedback
 }
 
 impl Default for DelayParams {
@@ -755,47 +763,69 @@ impl Default for DelayParams {
             time_ms: 300.0,
             feedback: 0.4,
             lpf_hz: 4000.0,
+            ping_pong: 0.0,
         }
     }
 }
 
-/// Mono delay with one-pole low-pass on the feedback path.
+/// Mono-in / stereo-out delay with one-pole low-pass on the feedback path.
+/// At ping_pong = 0 the two delay lines run in parallel (identical L+R).
+/// At ping_pong = 1 the input lands on L only and feedback crosses fully L<->R.
 pub struct Delay {
-    buf: Vec<f32>,
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
     write_idx: usize,
     sample_rate: u32,
-    fb_z: f32,
+    fb_z_l: f32,
+    fb_z_r: f32,
 }
 
 impl Delay {
     pub fn new(sample_rate: u32, max_time_ms: f32) -> Self {
         let len = ((max_time_ms / 1000.0) * sample_rate as f32).ceil() as usize + 1;
+        let len = len.max(2);
         Self {
-            buf: vec![0.0; len.max(2)],
+            buf_l: vec![0.0; len],
+            buf_r: vec![0.0; len],
             write_idx: 0,
             sample_rate,
-            fb_z: 0.0,
+            fb_z_l: 0.0,
+            fb_z_r: 0.0,
         }
     }
 
-    /// In-place: `io` enters as the send signal, exits as the wet (delayed) signal.
-    pub fn process(&mut self, io: &mut [f32], params: DelayParams) {
+    /// `input` is the mono send signal. `out_l` / `out_r` receive the wet
+    /// (delayed) signal. All three slices must be the same length.
+    pub fn process(&mut self, input: &[f32], out_l: &mut [f32], out_r: &mut [f32], params: DelayParams) {
         let sr = self.sample_rate as f32;
-        let buf_len = self.buf.len();
+        let buf_len = self.buf_l.len();
         let delay_samples = ((params.time_ms.max(1.0) / 1000.0) * sr) as usize;
         let delay_samples = delay_samples.clamp(1, buf_len - 1);
         let fb = params.feedback.clamp(0.0, 0.95);
         let lpf_a =
             (1.0 - (-TAU * params.lpf_hz.clamp(20.0, sr * 0.49) / sr).exp()).clamp(0.0, 1.0);
+        let pp = params.ping_pong.clamp(0.0, 1.0);
+        // Input distribution: ping_pong tilts the input to L only.
+        let in_l = 1.0 - 0.5 * pp;
+        let in_r = 1.0 - pp;
+        // Feedback routing: pp=0 → straight (L→L, R→R); pp=1 → fully crossed.
+        let self_fb = 1.0 - pp;
+        let cross_fb = pp;
 
-        for s in io.iter_mut() {
+        for i in 0..input.len() {
+            let s = input[i];
             let read_idx = (self.write_idx + buf_len - delay_samples) % buf_len;
-            let delayed = self.buf[read_idx];
-            // LPF the feedback path so repeats darken naturally.
-            self.fb_z += lpf_a * (delayed - self.fb_z);
-            self.buf[self.write_idx] = *s + self.fb_z * fb;
+            let dl = self.buf_l[read_idx];
+            let dr = self.buf_r[read_idx];
+            self.fb_z_l += lpf_a * (dl - self.fb_z_l);
+            self.fb_z_r += lpf_a * (dr - self.fb_z_r);
+            self.buf_l[self.write_idx] =
+                s * in_l + (self.fb_z_l * self_fb + self.fb_z_r * cross_fb) * fb;
+            self.buf_r[self.write_idx] =
+                s * in_r + (self.fb_z_r * self_fb + self.fb_z_l * cross_fb) * fb;
             self.write_idx = (self.write_idx + 1) % buf_len;
-            *s = delayed;
+            out_l[i] = dl;
+            out_r[i] = dr;
         }
     }
 }
@@ -848,11 +878,19 @@ pub struct BusDistortion {
     fb_state: f32,
     gate_env: f32,
     gate_smooth: f32,
+    // DC-blocker state (one-pole HPF). Necessary because `bias` shifts the
+    // stage 2 operating point, which produces a constant offset at the
+    // output even with zero input.
+    dc_x_prev: f32,
+    dc_y_prev: f32,
+    dc_r: f32,
     sample_rate: u32,
 }
 
 impl BusDistortion {
     pub fn new(sample_rate: u32) -> Self {
+        // ~5 Hz corner: R = exp(-2*pi*fc/sr).
+        let dc_r = (-TAU * 5.0 / sample_rate as f32).exp();
         Self {
             stage1_pre: Biquad::new(80.0, 0.707, FilterMode::HighPass, sample_rate),
             stage1_post: Biquad::new(2500.0, 0.707, FilterMode::LowPass, sample_rate),
@@ -861,6 +899,9 @@ impl BusDistortion {
             fb_state: 0.0,
             gate_env: 0.0,
             gate_smooth: 0.0,
+            dc_x_prev: 0.0,
+            dc_y_prev: 0.0,
+            dc_r,
             sample_rate,
         }
     }
@@ -929,7 +970,13 @@ impl BusDistortion {
                 x *= self.gate_smooth;
             }
 
-            *s = x * out_gain;
+            // DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1]
+            let xn = x;
+            let yn = xn - self.dc_x_prev + self.dc_r * self.dc_y_prev;
+            self.dc_x_prev = xn;
+            self.dc_y_prev = yn;
+
+            *s = yn * out_gain;
         }
     }
 }
@@ -1038,6 +1085,91 @@ impl Reverb {
             }
             // Normalize: 8 combs in parallel, scale down.
             *s = wet * 0.125 * out_gain;
+        }
+    }
+}
+
+// --- Master compressor -------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompressorParams {
+    pub threshold_db: f32, // -60..0
+    pub ratio: f32,        // 1..20 (1 = no compression)
+    pub attack_ms: f32,    // 0.1..200
+    pub release_ms: f32,   // 5..2000
+    pub makeup_db: f32,    // -12..24
+    /// Downward gate. Signal below this level is muted (smoothed). Set very
+    /// low (e.g. -120) to effectively disable.
+    pub gate_db: f32, // -120..0
+}
+
+impl Default for CompressorParams {
+    fn default() -> Self {
+        Self {
+            threshold_db: 0.0,
+            ratio: 1.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 0.0,
+            gate_db: -120.0,
+        }
+    }
+}
+
+pub struct Compressor {
+    sample_rate: u32,
+    env_db: f32,   // smoothed level in dB
+    gate_open: f32, // 0..1, smoothed gate gain
+}
+
+impl Compressor {
+    pub fn new(sample_rate: u32) -> Self {
+        Self { sample_rate, env_db: -120.0, gate_open: 0.0 }
+    }
+
+    /// Stereo, linked detector (envelope follows max(|L|,|R|)) so the image
+    /// stays put under heavy compression. `l` and `r` must be the same length.
+    pub fn process(&mut self, l: &mut [f32], r: &mut [f32], params: CompressorParams) {
+        let sr = self.sample_rate as f32;
+        let atk_t = (params.attack_ms.max(0.1)) * 0.001;
+        let rel_t = (params.release_ms.max(0.1)) * 0.001;
+        let atk_a = (-1.0 / (atk_t * sr)).exp();
+        let rel_a = (-1.0 / (rel_t * sr)).exp();
+        let thr = params.threshold_db;
+        let ratio = params.ratio.max(1.0);
+        let makeup_lin = 10f32.powf(params.makeup_db / 20.0);
+        let inv_ratio = 1.0 / ratio;
+        let gate_thr = params.gate_db;
+        // ~5 ms open / ~80 ms close — short enough to grab transients, long
+        // enough to avoid chatter on quiet content.
+        let gate_open_a = (-1.0 / (0.005 * sr)).exp();
+        let gate_close_a = (-1.0 / (0.080 * sr)).exp();
+        // 6 dB hysteresis so the gate doesn't chatter right at the threshold.
+        let gate_close_thr = gate_thr - 6.0;
+
+        for i in 0..l.len() {
+            let abs = l[i].abs().max(r[i].abs()).max(1e-9);
+            let in_db = 20.0 * abs.log10();
+            let a = if in_db > self.env_db { atk_a } else { rel_a };
+            self.env_db = a * self.env_db + (1.0 - a) * in_db;
+
+            // Gate target: open when above the upper threshold, closed when
+            // below the lower (hysteresis). In between, hold current state.
+            let target = if self.env_db > gate_thr {
+                1.0
+            } else if self.env_db < gate_close_thr {
+                0.0
+            } else {
+                self.gate_open
+            };
+            let gate_a = if target > self.gate_open { gate_open_a } else { gate_close_a };
+            self.gate_open = gate_a * self.gate_open + (1.0 - gate_a) * target;
+
+            let over = self.env_db - thr;
+            let gain_db = if over > 0.0 { -over * (1.0 - inv_ratio) } else { 0.0 };
+            let gain_lin = 10f32.powf(gain_db / 20.0) * makeup_lin * self.gate_open;
+            l[i] *= gain_lin;
+            r[i] *= gain_lin;
         }
     }
 }
@@ -1235,6 +1367,7 @@ impl DrumVoiceParams {
             send_reverb: 0.0,
             send_distortion: 0.0,
             master_gain: 0.70,
+            pan: 0.0,
         }
     }
 }

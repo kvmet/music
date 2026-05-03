@@ -9,14 +9,9 @@ use std::time::Instant;
 const NUM_SCENES: usize = 8;
 const SCENE_SAVE_HOLD_SECS: f32 = 2.0;
 use synth::{
-    BusDistortionParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode, NoiseColor,
-    ReverbParams, StepLocks, Wave,
+    BusDistortionParams, CompressorParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode,
+    NoiseColor, ReverbParams, StepLocks, Wave,
 };
-
-const VOICE_NAMES: [&str; VOICES] = [
-    "kick", "snare", "closed hat", "open hat", "tom lo", "tom hi", "clap", "rim",
-    "perc lo", "bass",
-];
 
 /// Discrete edit destination for slider changes.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +55,7 @@ enum FieldEdit {
     SendReverb(f32),
     SendDistortion(f32),
     MasterGain(f32),
+    Pan(f32),
 }
 
 impl FieldEdit {
@@ -93,6 +89,7 @@ impl FieldEdit {
             FieldEdit::SendReverb(v) => p.send_reverb = v,
             FieldEdit::SendDistortion(v) => p.send_distortion = v,
             FieldEdit::MasterGain(v) => p.master_gain = v,
+            FieldEdit::Pan(v) => p.pan = v,
         }
     }
 
@@ -126,8 +123,17 @@ impl FieldEdit {
             FieldEdit::SendReverb(v) => l.send_reverb = Some(v),
             FieldEdit::SendDistortion(v) => l.send_distortion = Some(v),
             FieldEdit::MasterGain(v) => l.master_gain = Some(v),
+            FieldEdit::Pan(v) => l.pan = Some(v),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FxTab {
+    Delay,
+    Distortion,
+    Reverb,
+    Compressor,
 }
 
 struct App {
@@ -138,8 +144,10 @@ struct App {
     delay_params: DelayParams,
     bus_distortion_params: BusDistortionParams,
     reverb_params: ReverbParams,
+    compressor_params: CompressorParams,
     selected_voice: usize,
     bpm: u32,
+    master_gain: f32,
 
     // Stage 2: held keys + overdub.
     held_steps: [bool; STEPS],
@@ -157,6 +165,7 @@ struct App {
     /// (slot index, when the shift+hold started) — None if not currently saving.
     save_holding: Option<(usize, Instant)>,
     recorder: Arc<Recorder>,
+    fx_tab: FxTab,
 
     _stream: cpal::Stream, // hold to keep audio alive
 }
@@ -176,8 +185,10 @@ impl App {
             delay_params: DelayParams::default(),
             bus_distortion_params: BusDistortionParams::default(),
             reverb_params: ReverbParams::default(),
+            compressor_params: CompressorParams::default(),
             selected_voice: 0,
             bpm: 120,
+            master_gain: 1.0,
             held_steps: [false; STEPS],
             held_voices: [false; VOICES],
             step_edited: [false; STEPS],
@@ -187,6 +198,7 @@ impl App {
             scenes: std::array::from_fn(|_| None),
             save_holding: None,
             recorder,
+            fx_tab: FxTab::Delay,
             _stream: stream,
         }
     }
@@ -707,6 +719,7 @@ impl App {
             delay: self.delay_params,
             distortion: self.bus_distortion_params,
             reverb: self.reverb_params,
+            compressor: self.compressor_params,
         }
     }
 
@@ -723,6 +736,7 @@ impl App {
         self.delay_params = scene.delay;
         self.bus_distortion_params = scene.distortion;
         self.reverb_params = scene.reverb;
+        self.compressor_params = scene.compressor;
         // Apply atomically on the audio side via a single LoadScene command.
         self.send(Command::LoadScene(Box::new(scene)));
     }
@@ -819,6 +833,46 @@ impl App {
         }
     }
 
+    fn draw_master(&mut self, ui: &mut egui::Ui) {
+        ui.label("Master");
+        let mut g = self.master_gain;
+        if ui
+            .add(egui::Slider::new(&mut g, 0.0..=1.5).show_value(false))
+            .changed()
+        {
+            self.master_gain = g;
+            self.send(Command::SetMasterGain(g));
+        }
+        // Twin vertical peak meters next to the slider.
+        let (peak_l, peak_r) = self.handle.shared.peak_levels();
+        let size = egui::vec2(14.0, 22.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter();
+        let bg = ui.visuals().extreme_bg_color;
+        painter.rect_filled(rect, 2.0, bg);
+        let bar_w = (rect.width() - 2.0) * 0.5;
+        let draw_bar = |peak: f32, x: f32| {
+            // Linear up to 1.0, then a hard ceiling at 1.5 mapped to top.
+            let norm = (peak / 1.5).clamp(0.0, 1.0);
+            let h = rect.height() * norm;
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(x, rect.bottom() - h),
+                egui::vec2(bar_w, h),
+            );
+            // Green up to ~0.7, yellow to ~0.95, red above (linear thresholds).
+            let color = if peak > 0.95 {
+                egui::Color32::from_rgb(220, 60, 60)
+            } else if peak > 0.7 {
+                egui::Color32::from_rgb(220, 180, 60)
+            } else {
+                egui::Color32::from_rgb(70, 180, 90)
+            };
+            painter.rect_filled(bar, 0.0, color);
+        };
+        draw_bar(peak_l, rect.left() + 1.0);
+        draw_bar(peak_r, rect.left() + 1.0 + bar_w + 1.0);
+    }
+
     fn draw_record_button(&mut self, ui: &mut egui::Ui) {
         let recording = self.recorder.is_recording();
         if recording {
@@ -842,97 +896,147 @@ impl App {
         }
     }
 
-    fn draw_global_fx(&mut self, ui: &mut egui::Ui) {
-        ui.columns(3, |cols| {
-            // Delay
-            cols[0].label(egui::RichText::new("Delay").strong());
-            let mut d = self.delay_params;
-            let mut delay_changed = false;
-            slider(&mut cols[0], "time ms", d.time_ms, 5.0..=2000.0, true, d.time_ms, |v| {
-                d.time_ms = v;
-                delay_changed = true;
-            });
-            slider(&mut cols[0], "feedback", d.feedback, 0.0..=0.95, false, d.feedback, |v| {
-                d.feedback = v;
-                delay_changed = true;
-            });
-            slider(&mut cols[0], "tone hz", d.lpf_hz, 200.0..=16000.0, true, d.lpf_hz, |v| {
-                d.lpf_hz = v;
-                delay_changed = true;
-            });
-            if delay_changed {
-                self.delay_params = d;
-                self.send(Command::SetDelayParams(d));
-            }
-
-            // Distortion
-            cols[1].label(egui::RichText::new("Distortion").strong());
-            let mut x = self.bus_distortion_params;
-            let mut dist_changed = false;
-            cols[1].label("stage 1 (soft)");
-            slider(&mut cols[1], "drive", x.stage1_drive, 0.0..=1.0, false, x.stage1_drive, |v| {
-                x.stage1_drive = v;
-                dist_changed = true;
-            });
-            slider(&mut cols[1], "tone", x.stage1_tone, 0.0..=1.0, false, x.stage1_tone, |v| {
-                x.stage1_tone = v;
-                dist_changed = true;
-            });
-            cols[1].add_space(6.0);
-            cols[1].label("stage 2 (hard)");
-            slider(&mut cols[1], "drive", x.stage2_drive, 0.0..=1.0, false, x.stage2_drive, |v| {
-                x.stage2_drive = v;
-                dist_changed = true;
-            });
-            slider(&mut cols[1], "tone", x.stage2_tone, 0.0..=1.0, false, x.stage2_tone, |v| {
-                x.stage2_tone = v;
-                dist_changed = true;
-            });
-            cols[1].add_space(6.0);
-            cols[1].label("nasty");
-            slider(&mut cols[1], "bias", x.bias, 0.0..=1.0, false, x.bias, |v| {
-                x.bias = v;
-                dist_changed = true;
-            });
-            slider(&mut cols[1], "feedback", x.feedback, 0.0..=0.4, false, x.feedback, |v| {
-                x.feedback = v;
-                dist_changed = true;
-            });
-            slider(&mut cols[1], "gate", x.gate, 0.0..=1.0, false, x.gate, |v| {
-                x.gate = v;
-                dist_changed = true;
-            });
-            cols[1].add_space(6.0);
-            slider(&mut cols[1], "output", x.output, 0.0..=2.0, false, x.output, |v| {
-                x.output = v;
-                dist_changed = true;
-            });
-            if dist_changed {
-                self.bus_distortion_params = x;
-                self.send(Command::SetBusDistortionParams(x));
-            }
-
-            // Reverb
-            cols[2].label(egui::RichText::new("Reverb").strong());
-            let mut r = self.reverb_params;
-            let mut rev_changed = false;
-            slider(&mut cols[2], "size", r.size, 0.0..=1.0, false, r.size, |v| {
-                r.size = v;
-                rev_changed = true;
-            });
-            slider(&mut cols[2], "damp", r.damp, 0.0..=1.0, false, r.damp, |v| {
-                r.damp = v;
-                rev_changed = true;
-            });
-            slider(&mut cols[2], "output", r.output, 0.0..=2.0, false, r.output, |v| {
-                r.output = v;
-                rev_changed = true;
-            });
-            if rev_changed {
-                self.reverb_params = r;
-                self.send(Command::SetReverbParams(r));
-            }
+    fn draw_fx_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.fx_tab, FxTab::Delay, "Delay");
+            ui.selectable_value(&mut self.fx_tab, FxTab::Distortion, "Distortion");
+            ui.selectable_value(&mut self.fx_tab, FxTab::Reverb, "Reverb");
+            ui.selectable_value(&mut self.fx_tab, FxTab::Compressor, "Comp");
         });
+        ui.separator();
+        ui.add_space(4.0);
+        match self.fx_tab {
+            FxTab::Delay => self.draw_fx_delay(ui),
+            FxTab::Distortion => self.draw_fx_distortion(ui),
+            FxTab::Reverb => self.draw_fx_reverb(ui),
+            FxTab::Compressor => self.draw_fx_compressor(ui),
+        }
+    }
+
+    fn draw_fx_delay(&mut self, ui: &mut egui::Ui) {
+        let mut d = self.delay_params;
+        let mut changed = false;
+        slider(ui, "time ms", d.time_ms, 5.0..=2000.0, true, d.time_ms, |v| {
+            d.time_ms = v;
+            changed = true;
+        });
+        slider(ui, "feedback", d.feedback, 0.0..=0.95, false, d.feedback, |v| {
+            d.feedback = v;
+            changed = true;
+        });
+        slider(ui, "tone hz", d.lpf_hz, 200.0..=16000.0, true, d.lpf_hz, |v| {
+            d.lpf_hz = v;
+            changed = true;
+        });
+        slider(ui, "ping pong", d.ping_pong, 0.0..=1.0, false, d.ping_pong, |v| {
+            d.ping_pong = v;
+            changed = true;
+        });
+        if changed {
+            self.delay_params = d;
+            self.send(Command::SetDelayParams(d));
+        }
+    }
+
+    fn draw_fx_distortion(&mut self, ui: &mut egui::Ui) {
+        let mut x = self.bus_distortion_params;
+        let mut changed = false;
+        ui.label("stage 1 (soft)");
+        slider(ui, "drive", x.stage1_drive, 0.0..=1.0, false, x.stage1_drive, |v| {
+            x.stage1_drive = v;
+            changed = true;
+        });
+        slider(ui, "tone", x.stage1_tone, 0.0..=1.0, false, x.stage1_tone, |v| {
+            x.stage1_tone = v;
+            changed = true;
+        });
+        ui.add_space(6.0);
+        ui.label("stage 2 (hard)");
+        slider(ui, "drive", x.stage2_drive, 0.0..=1.0, false, x.stage2_drive, |v| {
+            x.stage2_drive = v;
+            changed = true;
+        });
+        slider(ui, "tone", x.stage2_tone, 0.0..=1.0, false, x.stage2_tone, |v| {
+            x.stage2_tone = v;
+            changed = true;
+        });
+        ui.add_space(6.0);
+        ui.label("nasty");
+        slider(ui, "bias", x.bias, 0.0..=1.0, false, x.bias, |v| {
+            x.bias = v;
+            changed = true;
+        });
+        slider(ui, "feedback", x.feedback, 0.0..=0.4, false, x.feedback, |v| {
+            x.feedback = v;
+            changed = true;
+        });
+        slider(ui, "gate", x.gate, 0.0..=1.0, false, x.gate, |v| {
+            x.gate = v;
+            changed = true;
+        });
+        ui.add_space(6.0);
+        slider(ui, "output", x.output, 0.0..=2.0, false, x.output, |v| {
+            x.output = v;
+            changed = true;
+        });
+        if changed {
+            self.bus_distortion_params = x;
+            self.send(Command::SetBusDistortionParams(x));
+        }
+    }
+
+    fn draw_fx_compressor(&mut self, ui: &mut egui::Ui) {
+        let mut c = self.compressor_params;
+        let mut changed = false;
+        slider(ui, "threshold dB", c.threshold_db, -60.0..=0.0, false, c.threshold_db, |v| {
+            c.threshold_db = v;
+            changed = true;
+        });
+        slider(ui, "ratio", c.ratio, 1.0..=20.0, true, c.ratio, |v| {
+            c.ratio = v;
+            changed = true;
+        });
+        slider(ui, "attack ms", c.attack_ms, 0.1..=200.0, true, c.attack_ms, |v| {
+            c.attack_ms = v;
+            changed = true;
+        });
+        slider(ui, "release ms", c.release_ms, 5.0..=2000.0, true, c.release_ms, |v| {
+            c.release_ms = v;
+            changed = true;
+        });
+        slider(ui, "makeup dB", c.makeup_db, -12.0..=24.0, false, c.makeup_db, |v| {
+            c.makeup_db = v;
+            changed = true;
+        });
+        slider(ui, "gate dB", c.gate_db, -120.0..=0.0, false, c.gate_db, |v| {
+            c.gate_db = v;
+            changed = true;
+        });
+        if changed {
+            self.compressor_params = c;
+            self.send(Command::SetCompressorParams(c));
+        }
+    }
+
+    fn draw_fx_reverb(&mut self, ui: &mut egui::Ui) {
+        let mut r = self.reverb_params;
+        let mut changed = false;
+        slider(ui, "size", r.size, 0.0..=1.0, false, r.size, |v| {
+            r.size = v;
+            changed = true;
+        });
+        slider(ui, "damp", r.damp, 0.0..=1.0, false, r.damp, |v| {
+            r.damp = v;
+            changed = true;
+        });
+        slider(ui, "output", r.output, 0.0..=2.0, false, r.output, |v| {
+            r.output = v;
+            changed = true;
+        });
+        if changed {
+            self.reverb_params = r;
+            self.send(Command::SetReverbParams(r));
+        }
     }
 
     fn draw_param_editor(&mut self, ui: &mut egui::Ui) {
@@ -949,12 +1053,7 @@ impl App {
                 EditTarget::StepLock(s) => format!("  (step {} lock)", s + 1),
                 EditTarget::Overdub(_) => "  (overdub)".to_string(),
             };
-            ui.heading(format!(
-                "Voice {} — {}{}",
-                display_voice + 1,
-                VOICE_NAMES[display_voice],
-                suffix
-            ));
+            ui.heading(format!("Voice {}{}", display_voice + 1, suffix));
         });
         ui.separator();
         ui.add_space(4.0);
@@ -963,8 +1062,8 @@ impl App {
 
         let mut edit: Option<FieldEdit> = None;
 
-        ui.columns(3, |cols| {
-            // ===== Col 0: Osc 1 + Osc 2 + FM =====
+        // Two columns: voice sources (left) | routing (right)
+        ui.columns(2, |cols| {
             cols[0].label(egui::RichText::new("Osc 1").strong());
             cols[0].horizontal(|ui| {
                 ui.label("wave");
@@ -998,6 +1097,7 @@ impl App {
             slider(&mut cols[0], "decay ms", p.osc1_amp_decay_ms, 1.0..=2000.0, true, mp.osc1_amp_decay_ms, |v| {
                 edit = Some(FieldEdit::Osc1AmpDecayMs(v));
             });
+
             cols[0].add_space(12.0);
             cols[0].label(egui::RichText::new("Osc 2").strong());
             cols[0].horizontal(|ui| {
@@ -1024,9 +1124,9 @@ impl App {
                 edit = Some(FieldEdit::FmAmount(v));
             });
 
-            // ===== Col 1: Noise =====
-            cols[1].label(egui::RichText::new("Noise").strong());
-            cols[1].horizontal(|ui| {
+            cols[0].add_space(12.0);
+            cols[0].label(egui::RichText::new("Noise").strong());
+            cols[0].horizontal(|ui| {
                 ui.label("color");
                 let mut c = p.noise_color;
                 for (cc, lbl) in [
@@ -1040,10 +1140,10 @@ impl App {
                     }
                 }
             });
-            slider(&mut cols[1], "level", p.noise_level, 0.0..=1.0, false, mp.noise_level, |v| {
+            slider(&mut cols[0], "level", p.noise_level, 0.0..=1.0, false, mp.noise_level, |v| {
                 edit = Some(FieldEdit::NoiseLevel(v));
             });
-            cols[1].horizontal(|ui| {
+            cols[0].horizontal(|ui| {
                 ui.label("filter");
                 let mut mode = p.noise_filter_mode;
                 for (mm, lbl) in [
@@ -1056,33 +1156,19 @@ impl App {
                     }
                 }
             });
-            slider(&mut cols[1], "filter hz", p.noise_filter_hz, 20.0..=18000.0, true, mp.noise_filter_hz, |v| {
+            slider(&mut cols[0], "filter hz", p.noise_filter_hz, 20.0..=18000.0, true, mp.noise_filter_hz, |v| {
                 edit = Some(FieldEdit::NoiseFilterHz(v));
             });
-            slider(&mut cols[1], "attack ms", p.noise_amp_attack_ms, 0.1..=200.0, true, mp.noise_amp_attack_ms, |v| {
+            slider(&mut cols[0], "attack ms", p.noise_amp_attack_ms, 0.1..=200.0, true, mp.noise_amp_attack_ms, |v| {
                 edit = Some(FieldEdit::NoiseAmpAttackMs(v));
             });
-            slider(&mut cols[1], "decay ms", p.noise_amp_decay_ms, 1.0..=2000.0, true, mp.noise_amp_decay_ms, |v| {
+            slider(&mut cols[0], "decay ms", p.noise_amp_decay_ms, 1.0..=2000.0, true, mp.noise_amp_decay_ms, |v| {
                 edit = Some(FieldEdit::NoiseAmpDecayMs(v));
             });
 
-            // ===== Col 2: FX → Filter → Master → Sends =====
-            cols[2].label(egui::RichText::new("FX").strong());
-            slider(&mut cols[2], "drive", p.drive, 0.0..=1.0, false, mp.drive, |v| {
-                edit = Some(FieldEdit::Drive(v));
-            });
-            slider(&mut cols[2], "fold", p.fold, 0.0..=1.0, false, mp.fold, |v| {
-                edit = Some(FieldEdit::Fold(v));
-            });
-            slider(&mut cols[2], "crush", p.crush, 0.0..=1.0, false, mp.crush, |v| {
-                edit = Some(FieldEdit::Crush(v));
-            });
-            slider(&mut cols[2], "srr", p.srr, 0.0..=1.0, false, mp.srr, |v| {
-                edit = Some(FieldEdit::Srr(v));
-            });
-            cols[2].add_space(12.0);
-            cols[2].label(egui::RichText::new("Filter").strong());
-            cols[2].horizontal(|ui| {
+            // ===== Col 1: Filter / FX / Sends =====
+            cols[1].label(egui::RichText::new("Filter").strong());
+            cols[1].horizontal(|ui| {
                 ui.label("mode");
                 let mut mode = p.post_filter_mode;
                 for (mm, lbl) in [
@@ -1096,27 +1182,44 @@ impl App {
                     }
                 }
             });
-            slider(&mut cols[2], "cutoff hz", p.post_filter_hz, 20.0..=18000.0, true, mp.post_filter_hz, |v| {
+            slider(&mut cols[1], "cutoff hz", p.post_filter_hz, 20.0..=18000.0, true, mp.post_filter_hz, |v| {
                 edit = Some(FieldEdit::PostFilterHz(v));
             });
-            slider(&mut cols[2], "resonance", p.post_filter_q, 0.5..=15.0, true, mp.post_filter_q, |v| {
+            slider(&mut cols[1], "resonance", p.post_filter_q, 0.5..=15.0, true, mp.post_filter_q, |v| {
                 edit = Some(FieldEdit::PostFilterQ(v));
             });
-            cols[2].add_space(12.0);
-            cols[2].label(egui::RichText::new("Master").strong());
-            slider(&mut cols[2], "gain", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
-                edit = Some(FieldEdit::MasterGain(v));
+
+            cols[1].add_space(12.0);
+            cols[1].label(egui::RichText::new("FX").strong());
+            slider(&mut cols[1], "drive", p.drive, 0.0..=1.0, false, mp.drive, |v| {
+                edit = Some(FieldEdit::Drive(v));
             });
-            cols[2].add_space(12.0);
-            cols[2].label(egui::RichText::new("Sends").strong());
-            slider(&mut cols[2], "delay", p.send_delay, 0.0..=1.0, false, mp.send_delay, |v| {
+            slider(&mut cols[1], "fold", p.fold, 0.0..=1.0, false, mp.fold, |v| {
+                edit = Some(FieldEdit::Fold(v));
+            });
+            slider(&mut cols[1], "crush", p.crush, 0.0..=1.0, false, mp.crush, |v| {
+                edit = Some(FieldEdit::Crush(v));
+            });
+            slider(&mut cols[1], "srr", p.srr, 0.0..=1.0, false, mp.srr, |v| {
+                edit = Some(FieldEdit::Srr(v));
+            });
+
+            cols[1].add_space(12.0);
+            cols[1].label(egui::RichText::new("Sends").strong());
+            slider(&mut cols[1], "delay", p.send_delay, 0.0..=1.0, false, mp.send_delay, |v| {
                 edit = Some(FieldEdit::SendDelay(v));
             });
-            slider(&mut cols[2], "reverb", p.send_reverb, 0.0..=1.0, false, mp.send_reverb, |v| {
+            slider(&mut cols[1], "reverb", p.send_reverb, 0.0..=1.0, false, mp.send_reverb, |v| {
                 edit = Some(FieldEdit::SendReverb(v));
             });
-            slider(&mut cols[2], "dist", p.send_distortion, 0.0..=1.0, false, mp.send_distortion, |v| {
+            slider(&mut cols[1], "dist", p.send_distortion, 0.0..=1.0, false, mp.send_distortion, |v| {
                 edit = Some(FieldEdit::SendDistortion(v));
+            });
+            slider(&mut cols[1], "pan", p.pan, -1.0..=1.0, false, mp.pan, |v| {
+                edit = Some(FieldEdit::Pan(v));
+            });
+            slider(&mut cols[1], "out", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
+                edit = Some(FieldEdit::MasterGain(v));
             });
         });
 
@@ -1190,6 +1293,8 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label("Scenes");
                 self.draw_scene_buttons(ui);
+                ui.separator();
+                self.draw_master(ui);
             });
             ui.add_space(4.0);
         });
@@ -1200,18 +1305,18 @@ impl eframe::App for App {
             ui.add_space(12.0);
         });
 
+        egui::Panel::right("fx_panel")
+            .resizable(true)
+            .default_size(280.0)
+            .show_inside(ui, |ui| {
+                ui.add_space(6.0);
+                self.draw_fx_panel(ui);
+            });
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(egui::RichText::new("Global FX").strong())
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            self.draw_global_fx(ui);
-                        });
-                    ui.add_space(8.0);
-                    ui.separator();
                     ui.add_space(8.0);
                     self.draw_param_editor(ui);
                 });
@@ -1254,23 +1359,41 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
     let recorder_audio = recorder.clone();
 
     let err_fn = |e| eprintln!("audio stream error: {e}");
-    let mut mono_buf: Vec<f32> = Vec::new();
+    let mut buf_l: Vec<f32> = Vec::new();
+    let mut buf_r: Vec<f32> = Vec::new();
+    let mut record_buf: Vec<f32> = Vec::new();
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_output_stream(
             &stream_config,
             move |out: &mut [f32], _| {
                 let frames = out.len() / channels;
-                if mono_buf.len() < frames {
-                    mono_buf.resize(frames, 0.0);
+                if buf_l.len() < frames {
+                    buf_l.resize(frames, 0.0);
+                    buf_r.resize(frames, 0.0);
+                    record_buf.resize(frames, 0.0);
                 }
-                let mono = &mut mono_buf[..frames];
-                engine.process(mono);
-                // Tap the mono signal for recording before duplicating to channels.
-                recorder_audio.push_samples(mono);
+                let l = &mut buf_l[..frames];
+                let r = &mut buf_r[..frames];
+                engine.process(l, r);
+                // Mono sum tap for the recorder.
+                let rec = &mut record_buf[..frames];
+                for i in 0..frames {
+                    rec[i] = (l[i] + r[i]) * 0.5;
+                }
+                recorder_audio.push_samples(rec);
+                // Distribute to output channels: L to ch0, R to ch1, then
+                // duplicate L+R fold for any extras.
                 for (i, frame) in out.chunks_mut(channels).enumerate() {
-                    for s in frame.iter_mut() {
-                        *s = mono[i];
+                    match channels {
+                        1 => frame[0] = rec[i],
+                        _ => {
+                            frame[0] = l[i];
+                            frame[1] = r[i];
+                            for s in &mut frame[2..] {
+                                *s = (l[i] + r[i]) * 0.5;
+                            }
+                        }
                     }
                 }
             },
