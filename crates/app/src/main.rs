@@ -1,6 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
-use engine::{Command, Engine, Handle, SceneData, STEPS, VOICES};
+use engine::{Command, Engine, Handle, SceneData, STEPS, TICKS_PER_STEP, VOICES};
 use record::Recorder;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -9,8 +9,8 @@ use std::time::Instant;
 const NUM_SCENES: usize = 8;
 const SCENE_SAVE_HOLD_SECS: f32 = 2.0;
 use synth::{
-    BusDistortionParams, CompressorParams, DelayParams, DrumVoice, DrumVoiceParams, FilterMode,
-    NoiseColor, ReverbParams, StepLocks, Wave,
+    BusDistortionParams, CompressorParams, DelayParams, DrumVoice, DrumVoiceParams, FieldEdit,
+    FilterMode, NoiseColor, ReverbParams, StepLocks, Wave,
 };
 
 /// Discrete edit destination for slider changes.
@@ -22,110 +22,6 @@ enum EditTarget {
     StepLock(usize),
     /// Accumulate into per-voice overdub buffer; applied at trigger time.
     Overdub(usize),
-}
-
-/// One slider change → one of these.
-#[derive(Clone, Copy, Debug)]
-enum FieldEdit {
-    Osc1Wave(Wave),
-    Osc1Level(f32),
-    Osc1StartHz(f32),
-    Osc1EndHz(f32),
-    Osc1PitchDecayMs(f32),
-    Osc1AmpAttackMs(f32),
-    Osc1AmpDecayMs(f32),
-    Osc2Wave(Wave),
-    Osc2Level(f32),
-    Osc2Ratio(f32),
-    FmAmount(f32),
-    NoiseColor(NoiseColor),
-    NoiseLevel(f32),
-    NoiseFilterHz(f32),
-    NoiseFilterMode(FilterMode),
-    NoiseAmpAttackMs(f32),
-    NoiseAmpDecayMs(f32),
-    Drive(f32),
-    Fold(f32),
-    Crush(f32),
-    Srr(f32),
-    PostFilterHz(f32),
-    PostFilterQ(f32),
-    PostFilterMode(FilterMode),
-    SendDelay(f32),
-    SendReverb(f32),
-    SendDistortion(f32),
-    MasterGain(f32),
-    Pan(f32),
-}
-
-impl FieldEdit {
-    fn apply_to_params(self, p: &mut DrumVoiceParams) {
-        match self {
-            FieldEdit::Osc1Wave(v) => p.osc1_wave = v,
-            FieldEdit::Osc1Level(v) => p.osc1_level = v,
-            FieldEdit::Osc1StartHz(v) => p.osc1_start_hz = v,
-            FieldEdit::Osc1EndHz(v) => p.osc1_end_hz = v,
-            FieldEdit::Osc1PitchDecayMs(v) => p.osc1_pitch_decay_ms = v,
-            FieldEdit::Osc1AmpAttackMs(v) => p.osc1_amp_attack_ms = v,
-            FieldEdit::Osc1AmpDecayMs(v) => p.osc1_amp_decay_ms = v,
-            FieldEdit::Osc2Wave(v) => p.osc2_wave = v,
-            FieldEdit::Osc2Level(v) => p.osc2_level = v,
-            FieldEdit::Osc2Ratio(v) => p.osc2_ratio = v,
-            FieldEdit::FmAmount(v) => p.fm_amount = v,
-            FieldEdit::NoiseColor(v) => p.noise_color = v,
-            FieldEdit::NoiseLevel(v) => p.noise_level = v,
-            FieldEdit::NoiseFilterHz(v) => p.noise_filter_hz = v,
-            FieldEdit::NoiseFilterMode(v) => p.noise_filter_mode = v,
-            FieldEdit::NoiseAmpAttackMs(v) => p.noise_amp_attack_ms = v,
-            FieldEdit::NoiseAmpDecayMs(v) => p.noise_amp_decay_ms = v,
-            FieldEdit::Drive(v) => p.drive = v,
-            FieldEdit::Fold(v) => p.fold = v,
-            FieldEdit::Crush(v) => p.crush = v,
-            FieldEdit::Srr(v) => p.srr = v,
-            FieldEdit::PostFilterHz(v) => p.post_filter_hz = v,
-            FieldEdit::PostFilterQ(v) => p.post_filter_q = v,
-            FieldEdit::PostFilterMode(v) => p.post_filter_mode = v,
-            FieldEdit::SendDelay(v) => p.send_delay = v,
-            FieldEdit::SendReverb(v) => p.send_reverb = v,
-            FieldEdit::SendDistortion(v) => p.send_distortion = v,
-            FieldEdit::MasterGain(v) => p.master_gain = v,
-            FieldEdit::Pan(v) => p.pan = v,
-        }
-    }
-
-    fn apply_to_locks(self, l: &mut StepLocks) {
-        match self {
-            FieldEdit::Osc1Wave(v) => l.osc1_wave = Some(v),
-            FieldEdit::Osc1Level(v) => l.osc1_level = Some(v),
-            FieldEdit::Osc1StartHz(v) => l.osc1_start_hz = Some(v),
-            FieldEdit::Osc1EndHz(v) => l.osc1_end_hz = Some(v),
-            FieldEdit::Osc1PitchDecayMs(v) => l.osc1_pitch_decay_ms = Some(v),
-            FieldEdit::Osc1AmpAttackMs(v) => l.osc1_amp_attack_ms = Some(v),
-            FieldEdit::Osc1AmpDecayMs(v) => l.osc1_amp_decay_ms = Some(v),
-            FieldEdit::Osc2Wave(v) => l.osc2_wave = Some(v),
-            FieldEdit::Osc2Level(v) => l.osc2_level = Some(v),
-            FieldEdit::Osc2Ratio(v) => l.osc2_ratio = Some(v),
-            FieldEdit::FmAmount(v) => l.fm_amount = Some(v),
-            FieldEdit::NoiseColor(v) => l.noise_color = Some(v),
-            FieldEdit::NoiseLevel(v) => l.noise_level = Some(v),
-            FieldEdit::NoiseFilterHz(v) => l.noise_filter_hz = Some(v),
-            FieldEdit::NoiseFilterMode(v) => l.noise_filter_mode = Some(v),
-            FieldEdit::NoiseAmpAttackMs(v) => l.noise_amp_attack_ms = Some(v),
-            FieldEdit::NoiseAmpDecayMs(v) => l.noise_amp_decay_ms = Some(v),
-            FieldEdit::Drive(v) => l.drive = Some(v),
-            FieldEdit::Fold(v) => l.fold = Some(v),
-            FieldEdit::Crush(v) => l.crush = Some(v),
-            FieldEdit::Srr(v) => l.srr = Some(v),
-            FieldEdit::PostFilterHz(v) => l.post_filter_hz = Some(v),
-            FieldEdit::PostFilterQ(v) => l.post_filter_q = Some(v),
-            FieldEdit::PostFilterMode(v) => l.post_filter_mode = Some(v),
-            FieldEdit::SendDelay(v) => l.send_delay = Some(v),
-            FieldEdit::SendReverb(v) => l.send_reverb = Some(v),
-            FieldEdit::SendDistortion(v) => l.send_distortion = Some(v),
-            FieldEdit::MasterGain(v) => l.master_gain = Some(v),
-            FieldEdit::Pan(v) => l.pan = Some(v),
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,6 +56,8 @@ struct App {
     last_step: Option<usize>,
     /// Per-voice mute state (UI mirror of engine).
     muted: [bool; VOICES],
+    /// Per-voice swing 0..100 (UI mirror of engine). 0 = straight.
+    voice_swing: [i8; VOICES],
     /// Saved snapshots of the entire kit + global FX state.
     scenes: [Option<SceneData>; NUM_SCENES],
     /// (slot index, when the shift+hold started) — None if not currently saving.
@@ -195,6 +93,7 @@ impl App {
             overdub_locks: [StepLocks::default(); VOICES],
             last_step: None,
             muted: [false; VOICES],
+            voice_swing: [0; VOICES],
             scenes: std::array::from_fn(|_| None),
             save_holding: None,
             recorder,
@@ -330,7 +229,7 @@ impl App {
                 continue;
             }
             // Merge overdub fields into existing step locks.
-            overlay_locks(&mut self.locks[v][cur], &self.overdub_locks[v]);
+            self.locks[v][cur].overlay(&self.overdub_locks[v]);
             self.send(Command::SetStepLocks {
                 voice: v,
                 step: cur,
@@ -378,6 +277,7 @@ impl App {
             shift_step_pressed,
             num_down,
             num_pressed,
+            shift_num_pressed,
             tab_down,
             plain_space,
             shift_space,
@@ -395,9 +295,13 @@ impl App {
             }
             let mut num_down = [false; VOICES];
             let mut num_pressed = [false; VOICES];
+            let mut shift_num_pressed = [false; VOICES];
             for (idx, k) in num_keys.iter().enumerate() {
                 num_down[idx] = i.key_down(*k);
                 num_pressed[idx] = i.key_pressed(*k);
+                if i.key_pressed(*k) && shift {
+                    shift_num_pressed[idx] = true;
+                }
             }
             let tab_down = i.key_down(Tab);
             let space = i.key_pressed(Space);
@@ -407,6 +311,7 @@ impl App {
                 shift_step_pressed,
                 num_down,
                 num_pressed,
+                shift_num_pressed,
                 tab_down,
                 space && !shift,
                 space && shift,
@@ -460,6 +365,24 @@ impl App {
                 }
                 if was_held && !num_down[v] {
                     self.overdub_locks[v] = StepLocks::default();
+                }
+            }
+        }
+
+        // Shift+number: live-trigger the voice. If transport is playing, also
+        // record the hit into the pattern at the nearest step (quantized).
+        // Locks on the target step are left untouched.
+        for v in 0..VOICES {
+            if !shift_num_pressed[v] {
+                continue;
+            }
+            self.send(Command::TriggerVoice { voice: v });
+            if self.playing() {
+                let tick = self.handle.shared.playhead_ticks.load(Ordering::Relaxed);
+                let step = ((tick + TICKS_PER_STEP / 2) / TICKS_PER_STEP) as usize % STEPS;
+                if !self.pattern[v][step] {
+                    self.pattern[v][step] = true;
+                    self.send(Command::SetStep { voice: v, step, on: true });
                 }
             }
         }
@@ -549,38 +472,6 @@ fn marker_shape(
         egui::pos2(x + half_w, rect.bottom()),
     );
     egui::Shape::rect_filled(r, 1.5, MARKER_COLOR)
-}
-
-/// Copy any Some fields from `src` into `target`, leaving target's other fields alone.
-fn overlay_locks(target: &mut StepLocks, src: &StepLocks) {
-    if src.osc1_wave.is_some() { target.osc1_wave = src.osc1_wave; }
-    if src.osc1_level.is_some() { target.osc1_level = src.osc1_level; }
-    if src.osc1_start_hz.is_some() { target.osc1_start_hz = src.osc1_start_hz; }
-    if src.osc1_end_hz.is_some() { target.osc1_end_hz = src.osc1_end_hz; }
-    if src.osc1_pitch_decay_ms.is_some() { target.osc1_pitch_decay_ms = src.osc1_pitch_decay_ms; }
-    if src.osc1_amp_attack_ms.is_some() { target.osc1_amp_attack_ms = src.osc1_amp_attack_ms; }
-    if src.osc1_amp_decay_ms.is_some() { target.osc1_amp_decay_ms = src.osc1_amp_decay_ms; }
-    if src.osc2_wave.is_some() { target.osc2_wave = src.osc2_wave; }
-    if src.osc2_level.is_some() { target.osc2_level = src.osc2_level; }
-    if src.osc2_ratio.is_some() { target.osc2_ratio = src.osc2_ratio; }
-    if src.fm_amount.is_some() { target.fm_amount = src.fm_amount; }
-    if src.noise_color.is_some() { target.noise_color = src.noise_color; }
-    if src.noise_level.is_some() { target.noise_level = src.noise_level; }
-    if src.noise_filter_hz.is_some() { target.noise_filter_hz = src.noise_filter_hz; }
-    if src.noise_filter_mode.is_some() { target.noise_filter_mode = src.noise_filter_mode; }
-    if src.noise_amp_attack_ms.is_some() { target.noise_amp_attack_ms = src.noise_amp_attack_ms; }
-    if src.noise_amp_decay_ms.is_some() { target.noise_amp_decay_ms = src.noise_amp_decay_ms; }
-    if src.drive.is_some() { target.drive = src.drive; }
-    if src.fold.is_some() { target.fold = src.fold; }
-    if src.crush.is_some() { target.crush = src.crush; }
-    if src.srr.is_some() { target.srr = src.srr; }
-    if src.post_filter_hz.is_some() { target.post_filter_hz = src.post_filter_hz; }
-    if src.post_filter_q.is_some() { target.post_filter_q = src.post_filter_q; }
-    if src.post_filter_mode.is_some() { target.post_filter_mode = src.post_filter_mode; }
-    if src.send_delay.is_some() { target.send_delay = src.send_delay; }
-    if src.send_reverb.is_some() { target.send_reverb = src.send_reverb; }
-    if src.send_distortion.is_some() { target.send_distortion = src.send_distortion; }
-    if src.master_gain.is_some() { target.master_gain = src.master_gain; }
 }
 
 const LOCK_COLOR: egui::Color32 = egui::Color32::BLACK;
@@ -715,6 +606,7 @@ impl App {
             pattern: self.pattern,
             locks: self.locks,
             muted: self.muted,
+            voice_swing: self.voice_swing,
             millibpm: self.bpm * 1000,
             delay: self.delay_params,
             distortion: self.bus_distortion_params,
@@ -732,6 +624,7 @@ impl App {
         self.pattern = scene.pattern;
         self.locks = scene.locks;
         self.muted = scene.muted;
+        self.voice_swing = scene.voice_swing;
         self.bpm = scene.millibpm / 1000;
         self.delay_params = scene.delay;
         self.bus_distortion_params = scene.distortion;
@@ -1221,6 +1114,21 @@ impl App {
             slider(&mut cols[1], "out", p.master_gain, 0.0..=2.0, false, mp.master_gain, |v| {
                 edit = Some(FieldEdit::MasterGain(v));
             });
+
+            // Per-voice non-lockable controls (timing etc.). Bypasses the
+            // FieldEdit/StepLocks machinery — always writes to voice-level state.
+            cols[1].add_space(12.0);
+            cols[1].label(egui::RichText::new("Voice").strong());
+            let v = self.selected_voice;
+            let mut swing_f = self.voice_swing[v] as f32;
+            slider(&mut cols[1], "swing", swing_f, 0.0..=100.0, false, swing_f, |nv| {
+                swing_f = nv;
+            });
+            let new_swing = swing_f.round().clamp(0.0, 100.0) as i8;
+            if new_swing != self.voice_swing[v] {
+                self.voice_swing[v] = new_swing;
+                self.send(Command::SetVoiceSwing { voice: v, swing: new_swing });
+            }
         });
 
         if let Some(e) = edit {
@@ -1371,22 +1279,23 @@ fn build_engine_and_stream() -> Result<Built, Box<dyn std::error::Error>> {
                 if buf_l.len() < frames {
                     buf_l.resize(frames, 0.0);
                     buf_r.resize(frames, 0.0);
-                    record_buf.resize(frames, 0.0);
+                    record_buf.resize(frames * 2, 0.0);
                 }
                 let l = &mut buf_l[..frames];
                 let r = &mut buf_r[..frames];
                 engine.process(l, r);
-                // Mono sum tap for the recorder.
-                let rec = &mut record_buf[..frames];
+                // Interleaved stereo tap for the recorder.
+                let rec = &mut record_buf[..frames * 2];
                 for i in 0..frames {
-                    rec[i] = (l[i] + r[i]) * 0.5;
+                    rec[i * 2] = l[i];
+                    rec[i * 2 + 1] = r[i];
                 }
                 recorder_audio.push_samples(rec);
                 // Distribute to output channels: L to ch0, R to ch1, then
                 // duplicate L+R fold for any extras.
                 for (i, frame) in out.chunks_mut(channels).enumerate() {
                     match channels {
-                        1 => frame[0] = rec[i],
+                        1 => frame[0] = (l[i] + r[i]) * 0.5,
                         _ => {
                             frame[0] = l[i];
                             frame[1] = r[i];

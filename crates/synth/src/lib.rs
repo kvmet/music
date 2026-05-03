@@ -412,185 +412,97 @@ impl DigitalState {
 
 // --- Drum voice --------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
-pub struct DrumVoiceParams {
-    // Osc 1 (main, with pitch envelope).
-    pub osc1_wave: Wave,
-    pub osc1_level: f32,
-    pub osc1_start_hz: f32,
-    pub osc1_end_hz: f32,
-    pub osc1_pitch_decay_ms: f32,
-    pub osc1_amp_attack_ms: f32,
-    pub osc1_amp_decay_ms: f32,
-
-    // Osc 2 (modulator / secondary). Tracks osc1's current pitch via ratio.
-    pub osc2_wave: Wave,
-    pub osc2_level: f32,
-    pub osc2_ratio: f32, // multiplier of osc1's instantaneous freq
-
-    /// Osc2 → osc1 frequency modulation index (0 = no FM).
-    pub fm_amount: f32,
-
-    // Noise (filtered, with own envelope).
-    pub noise_color: NoiseColor,
-    pub noise_level: f32,
-    pub noise_filter_hz: f32,
-    pub noise_filter_mode: FilterMode,
-    pub noise_amp_attack_ms: f32,
-    pub noise_amp_decay_ms: f32,
-
-    pub drive: f32,
-    pub fold: f32,
-    pub crush: f32,
-    pub srr: f32,
-
-    pub post_filter_hz: f32,
-    pub post_filter_q: f32,
-    pub post_filter_mode: FilterMode,
-
-    pub send_delay: f32,
-    pub send_reverb: f32,
-    pub send_distortion: f32,
-
-    pub master_gain: f32,
-    pub pan: f32, // -1.0 (L) .. 1.0 (R), equal-power
-}
-
-/// Per-step parameter overrides. None = inherit voice default.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StepLocks {
-    pub osc1_wave: Option<Wave>,
-    pub osc1_level: Option<f32>,
-    pub osc1_start_hz: Option<f32>,
-    pub osc1_end_hz: Option<f32>,
-    pub osc1_pitch_decay_ms: Option<f32>,
-    pub osc1_amp_attack_ms: Option<f32>,
-    pub osc1_amp_decay_ms: Option<f32>,
-    pub osc2_wave: Option<Wave>,
-    pub osc2_level: Option<f32>,
-    pub osc2_ratio: Option<f32>,
-    pub fm_amount: Option<f32>,
-    pub noise_color: Option<NoiseColor>,
-    pub noise_level: Option<f32>,
-    pub noise_filter_hz: Option<f32>,
-    pub noise_filter_mode: Option<FilterMode>,
-    pub noise_amp_attack_ms: Option<f32>,
-    pub noise_amp_decay_ms: Option<f32>,
-    pub drive: Option<f32>,
-    pub fold: Option<f32>,
-    pub crush: Option<f32>,
-    pub srr: Option<f32>,
-    pub post_filter_hz: Option<f32>,
-    pub post_filter_q: Option<f32>,
-    pub post_filter_mode: Option<FilterMode>,
-    pub send_delay: Option<f32>,
-    pub send_reverb: Option<f32>,
-    pub send_distortion: Option<f32>,
-    pub master_gain: Option<f32>,
-    pub pan: Option<f32>,
-}
-
-impl StepLocks {
-    pub fn is_empty(&self) -> bool {
-        self.osc1_wave.is_none()
-            && self.osc1_level.is_none()
-            && self.osc1_start_hz.is_none()
-            && self.osc1_end_hz.is_none()
-            && self.osc1_pitch_decay_ms.is_none()
-            && self.osc1_amp_attack_ms.is_none()
-            && self.osc1_amp_decay_ms.is_none()
-            && self.osc2_wave.is_none()
-            && self.osc2_level.is_none()
-            && self.osc2_ratio.is_none()
-            && self.fm_amount.is_none()
-            && self.noise_color.is_none()
-            && self.noise_level.is_none()
-            && self.noise_filter_hz.is_none()
-            && self.noise_filter_mode.is_none()
-            && self.noise_amp_attack_ms.is_none()
-            && self.noise_amp_decay_ms.is_none()
-            && self.drive.is_none()
-            && self.fold.is_none()
-            && self.crush.is_none()
-            && self.srr.is_none()
-            && self.post_filter_hz.is_none()
-            && self.post_filter_q.is_none()
-            && self.post_filter_mode.is_none()
-            && self.send_delay.is_none()
-            && self.send_reverb.is_none()
-            && self.send_distortion.is_none()
-            && self.master_gain.is_none()
-            && self.pan.is_none()
-    }
-
-    /// Apply any locked fields onto `p`. Unlocked fields leave `p` untouched.
-    pub fn merge_into(&self, p: &mut DrumVoiceParams) {
-        if let Some(v) = self.osc1_wave { p.osc1_wave = v; }
-        if let Some(v) = self.osc1_level { p.osc1_level = v; }
-        if let Some(v) = self.osc1_start_hz { p.osc1_start_hz = v; }
-        if let Some(v) = self.osc1_end_hz { p.osc1_end_hz = v; }
-        if let Some(v) = self.osc1_pitch_decay_ms { p.osc1_pitch_decay_ms = v; }
-        if let Some(v) = self.osc1_amp_attack_ms { p.osc1_amp_attack_ms = v; }
-        if let Some(v) = self.osc1_amp_decay_ms { p.osc1_amp_decay_ms = v; }
-        if let Some(v) = self.osc2_wave { p.osc2_wave = v; }
-        if let Some(v) = self.osc2_level { p.osc2_level = v; }
-        if let Some(v) = self.osc2_ratio { p.osc2_ratio = v; }
-        if let Some(v) = self.fm_amount { p.fm_amount = v; }
-        if let Some(v) = self.noise_color { p.noise_color = v; }
-        if let Some(v) = self.noise_level { p.noise_level = v; }
-        if let Some(v) = self.noise_filter_hz { p.noise_filter_hz = v; }
-        if let Some(v) = self.noise_filter_mode { p.noise_filter_mode = v; }
-        if let Some(v) = self.noise_amp_attack_ms { p.noise_amp_attack_ms = v; }
-        if let Some(v) = self.noise_amp_decay_ms { p.noise_amp_decay_ms = v; }
-        if let Some(v) = self.drive { p.drive = v; }
-        if let Some(v) = self.fold { p.fold = v; }
-        if let Some(v) = self.crush { p.crush = v; }
-        if let Some(v) = self.srr { p.srr = v; }
-        if let Some(v) = self.post_filter_hz { p.post_filter_hz = v; }
-        if let Some(v) = self.post_filter_q { p.post_filter_q = v; }
-        if let Some(v) = self.post_filter_mode { p.post_filter_mode = v; }
-        if let Some(v) = self.send_delay { p.send_delay = v; }
-        if let Some(v) = self.send_reverb { p.send_reverb = v; }
-        if let Some(v) = self.send_distortion { p.send_distortion = v; }
-        if let Some(v) = self.master_gain { p.master_gain = v; }
-        if let Some(v) = self.pan { p.pan = v; }
-    }
-}
-
-impl Default for DrumVoiceParams {
-    fn default() -> Self {
-        Self {
-            osc1_wave: Wave::Sine,
-            osc1_level: 0.0,
-            osc1_start_hz: 100.0,
-            osc1_end_hz: 100.0,
-            osc1_pitch_decay_ms: 50.0,
-            osc1_amp_attack_ms: 1.0,
-            osc1_amp_decay_ms: 100.0,
-            osc2_wave: Wave::Sine,
-            osc2_level: 0.0,
-            osc2_ratio: 1.0,
-            fm_amount: 0.0,
-            noise_color: NoiseColor::White,
-            noise_level: 0.0,
-            noise_filter_hz: 1000.0,
-            noise_filter_mode: FilterMode::Off,
-            noise_amp_attack_ms: 1.0,
-            noise_amp_decay_ms: 100.0,
-            drive: 0.0,
-            fold: 0.0,
-            crush: 0.0,
-            srr: 0.0,
-            post_filter_hz: 1000.0,
-            post_filter_q: 0.707,
-            post_filter_mode: FilterMode::Off,
-            send_delay: 0.0,
-            send_reverb: 0.0,
-            send_distortion: 0.0,
-            master_gain: 1.0,
-            pan: 0.0,
+/// Defines `DrumVoiceParams`, `StepLocks`, and `FieldEdit` from a single field
+/// list. Adding a new lockable parameter = adding one line below.
+macro_rules! define_params {
+    (
+        $(
+            $field:ident : $ty:ty = $default:expr => $variant:ident
+        ),* $(,)?
+    ) => {
+        #[derive(Clone, Copy, Debug)]
+        pub struct DrumVoiceParams {
+            $(pub $field: $ty,)*
         }
-    }
+
+        impl Default for DrumVoiceParams {
+            fn default() -> Self {
+                Self { $($field: $default,)* }
+            }
+        }
+
+        /// Per-step parameter overrides. `None` = inherit voice default.
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct StepLocks {
+            $(pub $field: Option<$ty>,)*
+        }
+
+        impl StepLocks {
+            pub fn is_empty(&self) -> bool {
+                $(self.$field.is_none() &&)* true
+            }
+
+            /// Apply any locked fields onto `p`. Unlocked fields leave `p` untouched.
+            pub fn merge_into(&self, p: &mut DrumVoiceParams) {
+                $(if let Some(v) = self.$field { p.$field = v; })*
+            }
+
+            /// Overlay `src`'s set fields onto `self`. Fields unset in `src`
+            /// leave `self` untouched.
+            pub fn overlay(&mut self, src: &StepLocks) {
+                $(if src.$field.is_some() { self.$field = src.$field; })*
+            }
+        }
+
+        /// One slider/control change. Routed to either voice defaults or step
+        /// locks depending on the current edit target.
+        #[derive(Clone, Copy, Debug)]
+        pub enum FieldEdit {
+            $($variant($ty),)*
+        }
+
+        impl FieldEdit {
+            pub fn apply_to_params(self, p: &mut DrumVoiceParams) {
+                match self { $(FieldEdit::$variant(v) => p.$field = v,)* }
+            }
+
+            pub fn apply_to_locks(self, l: &mut StepLocks) {
+                match self { $(FieldEdit::$variant(v) => l.$field = Some(v),)* }
+            }
+        }
+    };
+}
+
+define_params! {
+    osc1_wave:           Wave       = Wave::Sine        => Osc1Wave,
+    osc1_level:          f32        = 0.0               => Osc1Level,
+    osc1_start_hz:       f32        = 100.0             => Osc1StartHz,
+    osc1_end_hz:         f32        = 100.0             => Osc1EndHz,
+    osc1_pitch_decay_ms: f32        = 50.0              => Osc1PitchDecayMs,
+    osc1_amp_attack_ms:  f32        = 1.0               => Osc1AmpAttackMs,
+    osc1_amp_decay_ms:   f32        = 100.0             => Osc1AmpDecayMs,
+    osc2_wave:           Wave       = Wave::Sine        => Osc2Wave,
+    osc2_level:          f32        = 0.0               => Osc2Level,
+    osc2_ratio:          f32        = 1.0               => Osc2Ratio,
+    fm_amount:           f32        = 0.0               => FmAmount,
+    noise_color:         NoiseColor = NoiseColor::White => NoiseColor,
+    noise_level:         f32        = 0.0               => NoiseLevel,
+    noise_filter_hz:     f32        = 1000.0            => NoiseFilterHz,
+    noise_filter_mode:   FilterMode = FilterMode::Off   => NoiseFilterMode,
+    noise_amp_attack_ms: f32        = 1.0               => NoiseAmpAttackMs,
+    noise_amp_decay_ms:  f32        = 100.0             => NoiseAmpDecayMs,
+    drive:               f32        = 0.0               => Drive,
+    fold:                f32        = 0.0               => Fold,
+    crush:               f32        = 0.0               => Crush,
+    srr:                 f32        = 0.0               => Srr,
+    post_filter_hz:      f32        = 1000.0            => PostFilterHz,
+    post_filter_q:       f32        = 0.707             => PostFilterQ,
+    post_filter_mode:    FilterMode = FilterMode::Off   => PostFilterMode,
+    send_delay:          f32        = 0.0               => SendDelay,
+    send_reverb:         f32        = 0.0               => SendReverb,
+    send_distortion:     f32        = 0.0               => SendDistortion,
+    master_gain:         f32        = 1.0               => MasterGain,
+    pan:                 f32        = 0.0               => Pan,
 }
 
 pub struct DrumVoice {

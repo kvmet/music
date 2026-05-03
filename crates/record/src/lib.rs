@@ -1,6 +1,7 @@
 //! Live recorder. The audio thread calls [`Recorder::push_samples`] every
-//! buffer; samples are forwarded to a background writer thread that writes a
-//! 32-bit float mono WAV via `hound`.
+//! buffer with interleaved stereo (`[l0, r0, l1, r1, ...]`); samples are
+//! forwarded to a background writer thread that writes a 32-bit float stereo
+//! WAV via `hound`.
 //!
 //! The audio thread never blocks on I/O. It does briefly try-lock a `Mutex`
 //! during start/stop transitions, but contention is essentially zero (UI-driven
@@ -47,7 +48,7 @@ impl Recorder {
             return Err("already recording".into());
         }
         let spec = hound::WavSpec {
-            channels: 1,
+            channels: 2,
             sample_rate: self.sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,

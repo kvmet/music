@@ -36,11 +36,20 @@ pub struct SceneData {
     pub pattern: [[bool; STEPS]; VOICES],
     pub locks: [[StepLocks; STEPS]; VOICES],
     pub muted: [bool; VOICES],
+    pub voice_swing: [i8; VOICES],
     pub millibpm: u32,
     pub delay: DelayParams,
     pub distortion: BusDistortionParams,
     pub reverb: ReverbParams,
     pub compressor: CompressorParams,
+}
+
+/// Convert per-voice swing (0..=100) to a tick delay applied to off-beat
+/// (odd-indexed) steps. swing=100 delays by half a step (classic upper bound,
+/// triplet-feel territory). Values outside [0,100] are clamped.
+fn swing_delay_ticks(swing: i8) -> u64 {
+    let s = swing.clamp(0, 100) as u64;
+    s * TICKS_PER_STEP / 200
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +68,12 @@ pub enum Command {
     SetReverbParams(ReverbParams),
     SetCompressorParams(CompressorParams),
     SetVoiceMuted { voice: usize, muted: bool },
+    /// Per-voice swing in [0, 100]. 0 = straight; off-beat (odd) steps get
+    /// delayed by `swing/200` of a step's worth of ticks.
+    SetVoiceSwing { voice: usize, swing: i8 },
+    /// Trigger a voice immediately at its current defaults, ignoring step
+    /// position. Used for live play-in (shift+number). Honors mute.
+    TriggerVoice { voice: usize },
     /// Atomically replace pattern, locks, voice params, mutes, tempo, and
     /// global FX from a saved scene.
     LoadScene(Box<SceneData>),
@@ -99,6 +114,14 @@ pub struct Engine {
     voices: Vec<DrumVoice>,
     voice_defaults: [DrumVoiceParams; VOICES],
     muted: [bool; VOICES],
+    voice_swing: [i8; VOICES],
+    /// Deferred trig per voice: (absolute tick, step index). Set when an
+    /// off-beat step's swing pushes its fire past the boundary; cleared when
+    /// the fire happens or the transport is stopped/rewound. At most one slot
+    /// per voice — if a new boundary scheduled fire arrives before the prior
+    /// one resolved (rare: requires swing > one full step), the older one is
+    /// dropped.
+    pending_fire: [Option<(u64, usize)>; VOICES],
     // Mix routing scratch. Reused per buffer; grown lazily.
     voice_buf: Vec<f32>,
     mix_bus_l: Vec<f32>,
@@ -146,6 +169,8 @@ impl Engine {
             voices,
             voice_defaults,
             muted: [false; VOICES],
+            voice_swing: [0; VOICES],
+            pending_fire: [None; VOICES],
             voice_buf: Vec::new(),
             mix_bus_l: Vec::new(),
             mix_bus_r: Vec::new(),
@@ -199,28 +224,48 @@ impl Engine {
             let start_sample = self.transport.sample_position();
             let start_tick = self.transport.position().ticks;
 
+            // Fire any pending trigs scheduled exactly at start_tick.
+            self.fire_pending_at(start_tick);
+            // Step boundary coinciding with start_tick.
             if start_tick % TICKS_PER_STEP == 0 {
-                self.fire_step(start_tick);
+                self.handle_step_boundary(start_tick);
             }
 
             let mut written = 0usize;
             let mut next_step_tick = (start_tick / TICKS_PER_STEP + 1) * TICKS_PER_STEP;
 
             while written < total {
-                let next_step_sample =
-                    Position::from_ticks(next_step_tick).to_sample(&cfg);
-                let next_step_offset =
-                    next_step_sample.saturating_sub(start_sample) as usize;
-                let render_to = next_step_offset.min(total);
+                // Next event = earliest of (next step boundary, any pending
+                // fire ticks > start_tick). Pending fires from prior buffers
+                // could be in the past relative to start_tick if a buffer
+                // was unusually large; those got fired by `fire_pending_at`
+                // above (== case) and we ignore the < case (best-effort).
+                let mut next_event = next_step_tick;
+                for v in 0..VOICES {
+                    if let Some((t, _)) = self.pending_fire[v] {
+                        if t > start_tick && t < next_event {
+                            next_event = t;
+                        }
+                    }
+                }
+
+                let next_event_sample =
+                    Position::from_ticks(next_event).to_sample(&cfg);
+                let next_event_offset =
+                    next_event_sample.saturating_sub(start_sample) as usize;
+                let render_to = next_event_offset.min(total);
 
                 if render_to > written {
                     self.render_segment(written, render_to - written);
                     written = render_to;
                 }
 
-                if render_to == next_step_offset && render_to < total {
-                    self.fire_step(next_step_tick);
-                    next_step_tick += TICKS_PER_STEP;
+                if render_to == next_event_offset && render_to < total {
+                    self.fire_pending_at(next_event);
+                    if next_event == next_step_tick {
+                        self.handle_step_boundary(next_step_tick);
+                        next_step_tick += TICKS_PER_STEP;
+                    }
                 } else {
                     break;
                 }
@@ -328,25 +373,47 @@ impl Engine {
         }
     }
 
-    fn fire_step(&mut self, tick: u64) {
+    /// Process a step boundary at `tick`: for each voice with a trig at this
+    /// step, either fire immediately (on-beat or zero swing) or queue a
+    /// deferred fire (off-beat with swing).
+    fn handle_step_boundary(&mut self, tick: u64) {
         let step_idx = ((tick / TICKS_PER_STEP) as usize) % STEPS;
-        for (v, voice) in self.voices.iter_mut().enumerate() {
-            let s = &self.pattern[v][step_idx];
-            if !s.on {
+        for v in 0..VOICES {
+            if !self.pattern[v][step_idx].on || self.muted[v] {
                 continue;
             }
-            // Mute = skip new triggers; in-flight envelopes keep decaying
-            // naturally (no clicks).
-            if self.muted[v] {
-                continue;
+            let delay = if step_idx % 2 == 1 {
+                swing_delay_ticks(self.voice_swing[v])
+            } else {
+                0
+            };
+            if delay == 0 {
+                self.trigger_voice(v, step_idx);
+            } else {
+                self.pending_fire[v] = Some((tick + delay, step_idx));
             }
-            // Always reapply (defaults + locks) so a locked step doesn't leave
-            // its overrides stuck on the voice for the next trigger.
-            let mut params = self.voice_defaults[v];
-            s.locks.merge_into(&mut params);
-            voice.apply_params(params);
-            voice.trigger(1.0);
         }
+    }
+
+    /// Fire and clear any pending trigs whose scheduled tick equals `tick`.
+    fn fire_pending_at(&mut self, tick: u64) {
+        for v in 0..VOICES {
+            if let Some((t, idx)) = self.pending_fire[v] {
+                if t == tick {
+                    self.pending_fire[v] = None;
+                    self.trigger_voice(v, idx);
+                }
+            }
+        }
+    }
+
+    /// Apply (defaults + step locks) to a voice and trigger it. Always
+    /// reapplies so a previously-locked step doesn't leak its overrides.
+    fn trigger_voice(&mut self, v: usize, step_idx: usize) {
+        let mut params = self.voice_defaults[v];
+        self.pattern[v][step_idx].locks.merge_into(&mut params);
+        self.voices[v].apply_params(params);
+        self.voices[v].trigger(1.0);
     }
 
     fn publish(&self) {
@@ -397,6 +464,18 @@ impl Engine {
                     self.muted[voice] = muted;
                 }
             }
+            Command::SetVoiceSwing { voice, swing } => {
+                if voice < VOICES {
+                    self.voice_swing[voice] = swing.clamp(0, 100);
+                }
+            }
+            Command::TriggerVoice { voice } => {
+                if voice < VOICES && !self.muted[voice] {
+                    let p = self.voice_defaults[voice];
+                    self.voices[voice].apply_params(p);
+                    self.voices[voice].trigger(1.0);
+                }
+            }
             Command::LoadScene(scene) => {
                 let s = *scene;
                 self.voice_defaults = s.voice_params;
@@ -412,6 +491,8 @@ impl Engine {
                     }
                 }
                 self.muted = s.muted;
+                self.voice_swing = s.voice_swing;
+                self.pending_fire = [None; VOICES];
                 self.transport.set_tempo(s.millibpm);
                 self.delay_params = s.delay;
                 self.bus_distortion_params = s.distortion;
@@ -419,14 +500,19 @@ impl Engine {
                 self.compressor_params = s.compressor;
             }
             Command::Play => self.transport.play(),
-            Command::Stop => self.transport.stop(),
+            Command::Stop => {
+                self.transport.stop();
+                self.pending_fire = [None; VOICES];
+            }
             Command::StopAndRewind => {
                 self.transport.stop();
                 self.transport.seek(Position::default());
+                self.pending_fire = [None; VOICES];
             }
             Command::RewindAndPlay => {
                 self.transport.seek(Position::default());
                 self.transport.play();
+                self.pending_fire = [None; VOICES];
             }
             Command::SetTempo(mb) => self.transport.set_tempo(mb),
         }
