@@ -22,6 +22,11 @@ pub const VOICES: usize = 10;
 pub const STEPS: usize = 16;
 pub const TICKS_PER_STEP: u64 = 240; // 16th note at 960 PPQ
 const COMMAND_CAPACITY: usize = 256;
+/// Maximum audio buffer size we pre-allocate scratch space for. Audio hosts
+/// commonly use 64..2048 frames; 4096 covers worst-case sane configurations.
+/// If a host exceeds this, `ensure_bufs` will grow the buffers once on first
+/// occurrence (one-time allocation, not per-callback).
+const MAX_BUFFER_FRAMES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Step {
@@ -144,6 +149,13 @@ pub struct Engine {
     meter_r: f32,
     rx: Receiver<Command>,
     shared: Arc<Shared>,
+    /// Heap-owned command payloads (currently `Box<SceneData>`) get sent here
+    /// instead of dropping on the audio thread. A background "engine-gc"
+    /// thread drains and drops them. Bounded(8) so a burst of scene loads
+    /// doesn't unbound the channel; if it ever fills, the box drops on the
+    /// audio thread (rare; same as pre-fix behavior).
+    gc_tx: Option<Sender<Box<SceneData>>>,
+    gc_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 pub struct Handle {
@@ -163,6 +175,17 @@ impl Engine {
         });
         let voice_defaults: [DrumVoiceParams; VOICES] =
             std::array::from_fn(|i| *voices[i].params());
+        let (gc_tx, gc_rx) = bounded::<Box<SceneData>>(8);
+        let gc_handle = std::thread::Builder::new()
+            .name("engine-gc".into())
+            .spawn(move || {
+                // Drain and drop. Loop exits when all senders are dropped
+                // (Engine drop sets gc_tx to None first, see Drop impl).
+                while let Ok(_dead) = gc_rx.recv() {
+                    // _dead drops here, off the audio thread.
+                }
+            })
+            .ok();
         let engine = Self {
             transport: Transport::new(TransportConfig::new(120, sample_rate)),
             pattern: [[Step::default(); STEPS]; VOICES],
@@ -171,14 +194,14 @@ impl Engine {
             muted: [false; VOICES],
             voice_swing: [0; VOICES],
             pending_fire: [None; VOICES],
-            voice_buf: Vec::new(),
-            mix_bus_l: Vec::new(),
-            mix_bus_r: Vec::new(),
-            delay_bus: Vec::new(),
-            reverb_bus: Vec::new(),
-            distortion_bus: Vec::new(),
-            delay_wet_l: Vec::new(),
-            delay_wet_r: Vec::new(),
+            voice_buf: vec![0.0; MAX_BUFFER_FRAMES],
+            mix_bus_l: vec![0.0; MAX_BUFFER_FRAMES],
+            mix_bus_r: vec![0.0; MAX_BUFFER_FRAMES],
+            delay_bus: vec![0.0; MAX_BUFFER_FRAMES],
+            reverb_bus: vec![0.0; MAX_BUFFER_FRAMES],
+            distortion_bus: vec![0.0; MAX_BUFFER_FRAMES],
+            delay_wet_l: vec![0.0; MAX_BUFFER_FRAMES],
+            delay_wet_r: vec![0.0; MAX_BUFFER_FRAMES],
             delay: Delay::new(sample_rate, 2000.0),
             delay_params: DelayParams::default(),
             bus_distortion: BusDistortion::new(sample_rate),
@@ -192,6 +215,8 @@ impl Engine {
             meter_r: 0.0,
             rx,
             shared: shared.clone(),
+            gc_tx: Some(gc_tx),
+            gc_handle,
         };
         (engine, Handle { commands: tx, shared })
     }
@@ -236,10 +261,9 @@ impl Engine {
 
             while written < total {
                 // Next event = earliest of (next step boundary, any pending
-                // fire ticks > start_tick). Pending fires from prior buffers
-                // could be in the past relative to start_tick if a buffer
-                // was unusually large; those got fired by `fire_pending_at`
-                // above (== case) and we ignore the < case (best-effort).
+                // fire ticks > start_tick). `fire_pending_at(start_tick)` above
+                // already fired any trigs scheduled at or before this buffer's
+                // start (firing them late at offset 0 rather than dropping).
                 let mut next_event = next_step_tick;
                 for v in 0..VOICES {
                     if let Some((t, _)) = self.pending_fire[v] {
@@ -318,13 +342,23 @@ impl Engine {
         self.shared.peak_l.store(self.meter_l.to_bits(), Ordering::Relaxed);
         self.shared.peak_r.store(self.meter_r.to_bits(), Ordering::Relaxed);
 
+        // Publish BEFORE advancing the transport so the UI sees the tick
+        // corresponding to the audio just rendered, not the tick of the next
+        // buffer. Otherwise the UI playhead leads the audio by one buffer.
+        self.publish();
         if self.transport.state() == PlaybackState::Playing {
             self.transport.advance_samples(total as u64);
         }
-        self.publish();
     }
 
     fn ensure_bufs(&mut self, len: usize) {
+        // Buffers are pre-allocated to MAX_BUFFER_FRAMES in `new`. This grow
+        // path only triggers if a host requests an unusually large buffer; in
+        // that case we accept a one-time allocation here.
+        debug_assert!(
+            len <= MAX_BUFFER_FRAMES || self.voice_buf.len() >= len,
+            "audio buffer exceeded MAX_BUFFER_FRAMES; growing on RT path"
+        );
         if self.voice_buf.len() < len {
             self.voice_buf.resize(len, 0.0);
             self.mix_bus_l.resize(len, 0.0);
@@ -356,8 +390,8 @@ impl Engine {
             };
             for s in &mut self.voice_buf[..len] { *s = 0.0; }
             self.voices[v_idx].render_add(&mut self.voice_buf[..len]);
-            // Mute is implemented in `fire_step` (skips new triggers). The
-            // voice still renders so any in-flight envelope decays naturally.
+            // Mute is implemented in `handle_step_boundary` (skips new triggers).
+            // The voice still renders so any in-flight envelope decays naturally.
             // Sends tap the pre-fader signal; only the dry mix is scaled by
             // master_gain so users can solo a voice into FX.
             let dry_l = pan_l * gain;
@@ -395,12 +429,20 @@ impl Engine {
         }
     }
 
-    /// Fire and clear any pending trigs whose scheduled tick equals `tick`.
+    /// Fire and clear any pending trigs whose scheduled tick is at or before
+    /// `tick`. Trigs whose scheduled tick is in the past (relative to a buffer
+    /// start) fire late at offset 0 of the current buffer, which is preferable
+    /// to silently dropping them. Mute is rechecked here so that a voice muted
+    /// between the step boundary and its swing-deferred fire stays silent,
+    /// matching the muted-on-boundary behavior in `handle_step_boundary`.
     fn fire_pending_at(&mut self, tick: u64) {
         for v in 0..VOICES {
             if let Some((t, idx)) = self.pending_fire[v] {
-                if t == tick {
+                if t <= tick {
                     self.pending_fire[v] = None;
+                    if self.muted[v] {
+                        continue;
+                    }
                     self.trigger_voice(v, idx);
                 }
             }
@@ -477,27 +519,35 @@ impl Engine {
                 }
             }
             Command::LoadScene(scene) => {
-                let s = *scene;
-                self.voice_defaults = s.voice_params;
+                // Read fields through the Box (Deref) instead of moving out
+                // with `*scene`. All SceneData fields are Copy, so this just
+                // copies them to engine state without consuming the Box.
+                self.voice_defaults = scene.voice_params;
                 for v in 0..VOICES {
-                    self.voices[v].apply_params(s.voice_params[v]);
+                    self.voices[v].apply_params(scene.voice_params[v]);
                 }
                 for v in 0..VOICES {
                     for st in 0..STEPS {
                         self.pattern[v][st] = Step {
-                            on: s.pattern[v][st],
-                            locks: s.locks[v][st],
+                            on: scene.pattern[v][st],
+                            locks: scene.locks[v][st],
                         };
                     }
                 }
-                self.muted = s.muted;
-                self.voice_swing = s.voice_swing;
+                self.muted = scene.muted;
+                self.voice_swing = scene.voice_swing;
                 self.pending_fire = [None; VOICES];
-                self.transport.set_tempo(s.millibpm);
-                self.delay_params = s.delay;
-                self.bus_distortion_params = s.distortion;
-                self.reverb_params = s.reverb;
-                self.compressor_params = s.compressor;
+                self.transport.set_tempo(scene.millibpm);
+                self.delay_params = scene.delay;
+                self.bus_distortion_params = scene.distortion;
+                self.reverb_params = scene.reverb;
+                self.compressor_params = scene.compressor;
+                // Hand the box to the GC thread so the heap free happens off
+                // the audio thread. If the channel is full or the GC thread is
+                // gone, the box drops here (rare fallback; same as pre-fix).
+                if let Some(tx) = &self.gc_tx {
+                    let _ = tx.try_send(scene);
+                }
             }
             Command::Play => self.transport.play(),
             Command::Stop => {
@@ -515,6 +565,19 @@ impl Engine {
                 self.pending_fire = [None; VOICES];
             }
             Command::SetTempo(mb) => self.transport.set_tempo(mb),
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Drop the gc sender so the background thread's recv() returns Err
+        // and its loop exits. Then join. The thread drains any remaining
+        // boxes in the channel before exiting (recv() returns the queued
+        // items first, then Err).
+        self.gc_tx.take();
+        if let Some(h) = self.gc_handle.take() {
+            let _ = h.join();
         }
     }
 }

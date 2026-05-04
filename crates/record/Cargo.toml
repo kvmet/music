@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 hound = "3.5.1"
+rtrb = "0.3.4"
