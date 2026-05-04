@@ -1300,3 +1300,89 @@ impl DrumVoiceParams {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    #[test]
+    fn step_locks_default_is_empty_then_not() {
+        let mut locks = StepLocks::default();
+        assert!(locks.is_empty());
+        locks.pan = Some(0.5);
+        assert!(!locks.is_empty());
+    }
+
+    #[test]
+    fn merge_into_only_writes_set_fields() {
+        let mut params = DrumVoiceParams::default();
+        params.pan = 0.0;
+        params.master_gain = 0.5;
+        let mut locks = StepLocks::default();
+        locks.pan = Some(-0.7); // override pan only
+        locks.merge_into(&mut params);
+        assert_eq!(params.pan, -0.7, "pan should be overridden");
+        assert_eq!(params.master_gain, 0.5, "master_gain should be untouched");
+    }
+
+    #[test]
+    fn overlay_picks_up_src_set_fields() {
+        let mut dst = StepLocks::default();
+        dst.pan = Some(0.1);
+        let mut src = StepLocks::default();
+        src.master_gain = Some(0.9);
+        dst.overlay(&src);
+        assert_eq!(dst.pan, Some(0.1), "unset field in src should leave dst");
+        assert_eq!(dst.master_gain, Some(0.9), "set field in src should overwrite");
+
+        // Last-write wins when src also sets a field dst already had.
+        let mut src2 = StepLocks::default();
+        src2.pan = Some(-0.5);
+        dst.overlay(&src2);
+        assert_eq!(dst.pan, Some(-0.5));
+    }
+
+    #[test]
+    fn field_edit_round_trips() {
+        // f32 variant.
+        let mut params = DrumVoiceParams::default();
+        FieldEdit::Pan(0.42).apply_to_params(&mut params);
+        assert_eq!(params.pan, 0.42);
+
+        let mut locks = StepLocks::default();
+        FieldEdit::Pan(0.42).apply_to_locks(&mut locks);
+        assert_eq!(locks.pan, Some(0.42));
+
+        // Enum variant.
+        let mut params = DrumVoiceParams::default();
+        FieldEdit::Osc1Wave(Wave::Square).apply_to_params(&mut params);
+        assert!(matches!(params.osc1_wave, Wave::Square));
+    }
+
+    #[test]
+    fn drum_voice_output_is_finite() {
+        let mut v = DrumVoice::new(DrumVoiceParams::kick(), SR);
+        v.trigger(1.0);
+        let mut buf = vec![0.0f32; 4096];
+        v.render_add(&mut buf);
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "DrumVoice produced non-finite samples"
+        );
+    }
+
+    #[test]
+    fn drum_voice_decays_to_silence() {
+        let mut v = DrumVoice::new(DrumVoiceParams::kick(), SR);
+        v.trigger(1.0);
+        // 1 second at 48 kHz; kick decay is ~250 ms so tail should be quiet.
+        let mut buf = vec![0.0f32; SR as usize];
+        v.render_add(&mut buf);
+        // Look at the final 4 ms — should be effectively silent.
+        let tail = &buf[buf.len() - 192..];
+        let tail_max = tail.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(tail_max < 0.01, "tail not silent: max_abs = {tail_max}");
+    }
+}

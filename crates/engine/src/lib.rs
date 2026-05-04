@@ -582,6 +582,185 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synth::{
+        BusDistortionParams, CompressorParams, DelayParams, DrumVoice, DrumVoiceParams,
+        ReverbParams, StepLocks,
+    };
+
+    const SR: u32 = 48_000;
+
+    fn make_engine() -> (Engine, Handle) {
+        let voices: Vec<DrumVoice> = (0..VOICES)
+            .map(|_| DrumVoice::new(DrumVoiceParams::kick(), SR))
+            .collect();
+        let (engine, handle) = Engine::new(SR, voices);
+        // BusDistortion's `bias` default (0.25) makes the distortion bus produce
+        // a DC transient at idle, which would defeat the silence assertions
+        // below. Zero it for tests; this is unrelated to what we're testing.
+        let mut quiet = BusDistortionParams::default();
+        quiet.bias = 0.0;
+        handle
+            .commands
+            .send(Command::SetBusDistortionParams(quiet))
+            .unwrap();
+        (engine, handle)
+    }
+
+    /// Process `total` frames in audio-typical 1024-frame chunks (the engine's
+    /// scratch buffers are pre-sized for ≤ MAX_BUFFER_FRAMES).
+    fn process(engine: &mut Engine, total: usize) -> (Vec<f32>, Vec<f32>) {
+        const CHUNK: usize = 1024;
+        let mut l = Vec::with_capacity(total);
+        let mut r = Vec::with_capacity(total);
+        let mut written = 0;
+        while written < total {
+            let n = CHUNK.min(total - written);
+            let mut bl = vec![0.0; n];
+            let mut br = vec![0.0; n];
+            engine.process(&mut bl, &mut br);
+            l.extend_from_slice(&bl);
+            r.extend_from_slice(&br);
+            written += n;
+        }
+        (l, r)
+    }
+
+    fn max_abs(buf: &[f32]) -> f32 {
+        buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+    }
+
+    /// First sample index whose magnitude exceeds `thresh`, or `None` if silent.
+    fn first_nonzero(buf: &[f32], thresh: f32) -> Option<usize> {
+        buf.iter().position(|&s| s.abs() > thresh)
+    }
+
+    fn empty_scene() -> SceneData {
+        SceneData {
+            voice_params: [DrumVoiceParams::kick(); VOICES],
+            pattern: [[false; STEPS]; VOICES],
+            locks: [[StepLocks::default(); STEPS]; VOICES],
+            muted: [false; VOICES],
+            voice_swing: [0; VOICES],
+            millibpm: 120_000,
+            delay: DelayParams::default(),
+            distortion: BusDistortionParams::default(),
+            reverb: ReverbParams::default(),
+            compressor: CompressorParams::default(),
+        }
+    }
+
+    #[test]
+    fn step_at_zero_fires_on_play() {
+        let (mut engine, handle) = make_engine();
+        handle.commands.send(Command::SetStep { voice: 0, step: 0, on: true }).unwrap();
+        handle.commands.send(Command::Play).unwrap();
+        let (l, _r) = process(&mut engine, 1024);
+        assert!(max_abs(&l) > 0.01, "expected audio from step 0 trigger");
+    }
+
+    #[test]
+    fn muted_voice_is_silent() {
+        let (mut engine, handle) = make_engine();
+        handle.commands.send(Command::SetStep { voice: 0, step: 0, on: true }).unwrap();
+        handle.commands.send(Command::SetVoiceMuted { voice: 0, muted: true }).unwrap();
+        handle.commands.send(Command::Play).unwrap();
+        let (l, r) = process(&mut engine, 1024);
+        assert!(max_abs(&l) < 1e-4, "muted voice produced audio (L)");
+        assert!(max_abs(&r) < 1e-4, "muted voice produced audio (R)");
+    }
+
+    #[test]
+    fn stop_clears_pending_swing() {
+        // Off-beat step with full swing queues a deferred fire. Stop should
+        // discard it so no late trigger fires later.
+        let (mut engine, handle) = make_engine();
+        handle.commands.send(Command::SetStep { voice: 0, step: 1, on: true }).unwrap();
+        handle.commands.send(Command::SetVoiceSwing { voice: 0, swing: 100 }).unwrap();
+        handle.commands.send(Command::Play).unwrap();
+        // 7000 samples at 48k/120bpm crosses tick 240 (step 1 boundary, sample
+        // ~6000) but not tick 360 (deferred fire, sample ~9000). Should be
+        // silent so far (step 0 was off, deferred fire hasn't landed).
+        let (l_pre, _) = process(&mut engine, 7000);
+        assert!(max_abs(&l_pre) < 1e-4, "expected silence before deferred fire");
+
+        handle.commands.send(Command::Stop).unwrap();
+        // Process well past the deferred-fire sample. With Stop discarding the
+        // pending fire, output stays silent.
+        let (l_post, _) = process(&mut engine, 8000);
+        assert!(
+            max_abs(&l_post) < 1e-4,
+            "Stop did not discard pending swing-deferred fire"
+        );
+    }
+
+    #[test]
+    fn swing_delays_offbeat_fire() {
+        let render = |swing: i8| -> Option<usize> {
+            let (mut engine, handle) = make_engine();
+            handle.commands.send(Command::SetStep { voice: 0, step: 1, on: true }).unwrap();
+            handle.commands.send(Command::SetVoiceSwing { voice: 0, swing }).unwrap();
+            handle.commands.send(Command::Play).unwrap();
+            let (l, _) = process(&mut engine, 12_000);
+            first_nonzero(&l, 0.001)
+        };
+        let straight = render(0).expect("straight fire produced no audio");
+        let swung = render(100).expect("swung fire produced no audio");
+        // Don't pin to exact tick math; just require swing pushed the trigger
+        // significantly later (at 120 BPM / 48 kHz, half a step is ~3000
+        // samples; 1000 is a safe lower bound).
+        assert!(
+            swung > straight + 1000,
+            "expected swung fire to land much later: straight={straight}, swung={swung}"
+        );
+    }
+
+    #[test]
+    fn load_scene_swaps_pattern() {
+        let (mut engine, handle) = make_engine();
+        handle.commands.send(Command::Play).unwrap();
+        // Empty pattern: first buffer should be silent.
+        let (l_pre, _) = process(&mut engine, 1024);
+        assert!(max_abs(&l_pre) < 1e-4, "engine started with non-silent pattern");
+
+        // Stop + rewind so the next process starts at tick 0 again, where the
+        // newly-loaded scene's step 0 will fire.
+        handle.commands.send(Command::StopAndRewind).unwrap();
+        let _ = process(&mut engine, 1024);
+
+        let mut scene = empty_scene();
+        scene.pattern[0][0] = true;
+        handle.commands.send(Command::LoadScene(Box::new(scene))).unwrap();
+        handle.commands.send(Command::Play).unwrap();
+        let (l_post, _) = process(&mut engine, 1024);
+        assert!(
+            max_abs(&l_post) > 0.01,
+            "LoadScene did not apply: step 0 should fire"
+        );
+    }
+
+    #[test]
+    fn shared_step_advances_during_playback() {
+        let (mut engine, handle) = make_engine();
+        let shared = handle.shared.clone();
+        handle.commands.send(Command::Play).unwrap();
+        // First buffer publishes step 0 (start_tick=0). Process several more
+        // buffers to cross step boundaries.
+        let _ = process(&mut engine, 1024);
+        assert_eq!(shared.current_step(), 0);
+        // 12000 samples at 48 kHz / 120 BPM = ~480 ticks = 2 steps.
+        for _ in 0..12 {
+            let _ = process(&mut engine, 1024);
+        }
+        assert!(
+            shared.current_step() > 0,
+            "current_step did not advance after playback"
+        );
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // Drop the gc sender so the background thread's recv() returns Err

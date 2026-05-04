@@ -249,6 +249,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "millibpm must be > 0")]
+    fn set_tempo_zero_panics_in_debug() {
+        let mut t = Transport::new(cfg());
+        t.set_tempo(0);
+    }
+
+    #[test]
     fn advance_while_stopped_is_noop() {
         let cfg = cfg();
         let mut t = Transport::new(cfg);
