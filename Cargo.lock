@@ -3299,9 +3299,6 @@ dependencies = [
 [[package]]
 name = "transport"
 version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
-]
 
 [[package]]
 name = "ttf-parser"

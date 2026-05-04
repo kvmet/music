@@ -8,3 +8,4 @@ transport = { path = "crates/transport" }
 synth = { path = "crates/synth" }
 engine = { path = "crates/engine" }
 record = { path = "crates/record" }
+crossbeam-channel = "0.5.15"

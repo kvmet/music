@@ -790,6 +790,13 @@ pub struct BusDistortion {
     fb_state: f32,
     gate_env: f32,
     gate_smooth: f32,
+    /// Peak-follower release coefficient per sample. Time-equivalent to
+    /// 0.97/sample at 44.1 kHz (~0.7 ms half-life), recomputed for the actual
+    /// sample rate so gate behavior is consistent at 48 k vs 96 k.
+    gate_release: f32,
+    /// One-pole smoothing alpha for gate gain. Time-equivalent to 0.5/sample at
+    /// 44.1 kHz, recomputed for the actual sample rate.
+    gate_smooth_alpha: f32,
     // DC-blocker state (one-pole HPF). Necessary because `bias` shifts the
     // stage 2 operating point, which produces a constant offset at the
     // output even with zero input.
@@ -803,6 +810,14 @@ impl BusDistortion {
     pub fn new(sample_rate: u32) -> Self {
         // ~5 Hz corner: R = exp(-2*pi*fc/sr).
         let dc_r = (-TAU * 5.0 / sample_rate as f32).exp();
+        // Convert per-sample coefficients pinned to 44.1 kHz into time-equivalent
+        // coefficients at the actual sample rate. For a one-pole release `env *= k`,
+        // the time-domain ratio is `k_new = k_ref^(sr_ref / sr)`. For the smoothing
+        // step `x += a * (target - x)` the leakage `(1 - a)` follows the same rule,
+        // so `a_new = 1 - (1 - a_ref)^(sr_ref / sr)`.
+        let ratio = 44100.0_f32 / sample_rate as f32;
+        let gate_release = 0.97_f32.powf(ratio);
+        let gate_smooth_alpha = 1.0 - 0.5_f32.powf(ratio);
         Self {
             stage1_pre: Biquad::new(80.0, 0.707, FilterMode::HighPass, sample_rate),
             stage1_post: Biquad::new(2500.0, 0.707, FilterMode::LowPass, sample_rate),
@@ -811,6 +826,8 @@ impl BusDistortion {
             fb_state: 0.0,
             gate_env: 0.0,
             gate_smooth: 0.0,
+            gate_release,
+            gate_smooth_alpha,
             dc_x_prev: 0.0,
             dc_y_prev: 0.0,
             dc_r,
@@ -876,9 +893,9 @@ impl BusDistortion {
             // cycles, so a high threshold makes the gate flutter.
             if gate_amt > 0.001 {
                 let abs_x = x.abs();
-                self.gate_env = (self.gate_env * 0.97).max(abs_x);
+                self.gate_env = (self.gate_env * self.gate_release).max(abs_x);
                 let target = if self.gate_env > gate_threshold { 1.0 } else { 0.0 };
-                self.gate_smooth += 0.5 * (target - self.gate_smooth);
+                self.gate_smooth += self.gate_smooth_alpha * (target - self.gate_smooth);
                 x *= self.gate_smooth;
             }
 

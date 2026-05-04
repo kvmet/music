@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 transport = { workspace = true }
 synth = { workspace = true }
-crossbeam-channel = "0.5.15"
+crossbeam-channel = { workspace = true }

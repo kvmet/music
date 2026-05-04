@@ -80,7 +80,20 @@ pub enum Command {
     /// position. Used for live play-in (shift+number). Honors mute.
     TriggerVoice { voice: usize },
     /// Atomically replace pattern, locks, voice params, mutes, tempo, and
-    /// global FX from a saved scene.
+    /// global FX *params* from a saved scene.
+    ///
+    /// **Intentionally preserved across the swap:**
+    /// - Transport position. Playback continues from wherever it was; the
+    ///   sequencer does not rewind. Use `StopAndRewind` first if a clean
+    ///   restart is desired.
+    /// - FX processor *state* (delay lines, reverb comb/allpass buffers,
+    ///   distortion feedback, compressor gain envelope). Only the FX params
+    ///   are swapped; existing tails ring out into the new scene.
+    ///
+    /// Rationale: scenes are intended for pattern-level switching within a
+    /// song, not whole-song transitions. Continuous transport and bleeding
+    /// FX tails make those transitions musical. If you need a clean break,
+    /// issue `StopAndRewind` then `LoadScene`.
     LoadScene(Box<SceneData>),
     Play,
     Stop,

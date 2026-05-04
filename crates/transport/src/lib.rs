@@ -1,7 +1,3 @@
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-
-const CHANNEL_CAPACITY: usize = 256;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeSignature {
     pub beats_per_measure: u32,
@@ -115,16 +111,6 @@ fn samples_to_ticks(samples: u64, cfg: &TransportConfig) -> u64 {
     ((numer + denom / 2) / denom) as u64
 }
 
-#[derive(Debug, Clone)]
-pub enum TransportEvent {
-    Play(Position),
-    Stop(Position),
-    Seek(Position),
-    Tick(Position),
-    TempoChange { millibpm: u32, position: Position },
-    TimeSignatureChange { time_signature: TimeSignature, position: Position },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
     Stopped,
@@ -136,7 +122,6 @@ pub struct Transport {
     position: Position,
     sample_position: u64,
     state: PlaybackState,
-    subscribers: Vec<Sender<TransportEvent>>,
 }
 
 impl Transport {
@@ -146,30 +131,20 @@ impl Transport {
             position: Position::default(),
             sample_position: 0,
             state: PlaybackState::Stopped,
-            subscribers: Vec::new(),
         }
-    }
-
-    pub fn subscribe(&mut self) -> Receiver<TransportEvent> {
-        let (tx, rx) = bounded(CHANNEL_CAPACITY);
-        self.subscribers.push(tx);
-        rx
     }
 
     pub fn play(&mut self) {
         self.state = PlaybackState::Playing;
-        self.emit(TransportEvent::Play(self.position));
     }
 
     pub fn stop(&mut self) {
         self.state = PlaybackState::Stopped;
-        self.emit(TransportEvent::Stop(self.position));
     }
 
     pub fn seek(&mut self, position: Position) {
         self.position = position;
         self.sample_position = position.to_sample(&self.config);
-        self.emit(TransportEvent::Seek(position));
     }
 
     /// Called by the audio thread each buffer. Only advances when playing.
@@ -179,32 +154,23 @@ impl Transport {
         }
         self.sample_position += samples;
         self.position = Position::from_sample(self.sample_position, &self.config);
-        self.emit(TransportEvent::Tick(self.position));
     }
 
-    /// Advance by ticks — for scrubbing and non-audio-driven use.
+    /// Advance by ticks, for scrubbing and non-audio-driven use.
     pub fn advance_ticks(&mut self, ticks: u64) {
         self.position.ticks += ticks;
         self.sample_position = self.position.to_sample(&self.config);
-        self.emit(TransportEvent::Tick(self.position));
     }
 
     pub fn set_tempo(&mut self, millibpm: u32) {
+        debug_assert!(millibpm > 0, "millibpm must be > 0");
         self.config.millibpm = millibpm;
         // Resync sample position from ticks so tempo change doesn't cause a jump.
         self.sample_position = self.position.to_sample(&self.config);
-        self.emit(TransportEvent::TempoChange {
-            millibpm,
-            position: self.position,
-        });
     }
 
     pub fn set_time_signature(&mut self, time_signature: TimeSignature) {
         self.config.time_signature = time_signature;
-        self.emit(TransportEvent::TimeSignatureChange {
-            time_signature,
-            position: self.position,
-        });
     }
 
     pub fn position(&self) -> Position {
@@ -221,16 +187,6 @@ impl Transport {
 
     pub fn config(&self) -> &TransportConfig {
         &self.config
-    }
-
-    fn emit(&mut self, event: TransportEvent) {
-        self.subscribers.retain(|tx| {
-            match tx.try_send(event.clone()) {
-                Ok(()) => true,
-                Err(TrySendError::Disconnected(_)) => false,
-                Err(TrySendError::Full(_)) => true,
-            }
-        });
     }
 }
 
@@ -290,16 +246,6 @@ mod tests {
         let pos = Position::from_beat(4, &cfg);
         t.seek(pos);
         assert_eq!(t.sample_position(), pos.to_sample(&cfg));
-    }
-
-    #[test]
-    fn subscribe_receives_events() {
-        let mut t = Transport::new(cfg());
-        let rx = t.subscribe();
-        t.play();
-        t.stop();
-        assert!(matches!(rx.try_recv().unwrap(), TransportEvent::Play(_)));
-        assert!(matches!(rx.try_recv().unwrap(), TransportEvent::Stop(_)));
     }
 
     #[test]
